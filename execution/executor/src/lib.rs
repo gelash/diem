@@ -272,13 +272,13 @@ where
         let new_epoch_marker = vm_outputs
             .iter()
             .enumerate()
-            .filter(|(_, output)| {
+            .find(|(_, output)| {
                 output
                     .events()
                     .iter()
                     .any(|event| *event.key() == new_epoch_event_key)
             })
-            .next()
+            // Off by one for exclusive index.
             .map(|(idx, _)| idx + 1);
         let transaction_count = new_epoch_marker.unwrap_or(vm_outputs.len());
 

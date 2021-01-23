@@ -24,12 +24,22 @@ pub fn generate_genesis_state() -> (
     let tree: SparseMerkleTree = Default::default();
     let mut account_states = HashMap::new();
 
-    process_write_set(
+    let blobs = process_write_set(
         &txn,
         &mut account_states,
-        &proof_reader,
         change_set.write_set().clone(),
-        &tree,
     )
-    .unwrap()
+    .unwrap();
+    let new_tree = Arc::new(
+        tree
+            .update(
+                updated_blobs
+                    .iter()
+                    .map(|(addr, value)| (addr.hash(), value.clone()))
+                    .collect(),
+                &proof_reader,
+            )
+            .expect("Failed to update state tree."),
+    );
+    (blobs, new_tree)
 }
