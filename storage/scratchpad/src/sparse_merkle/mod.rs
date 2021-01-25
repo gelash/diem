@@ -117,6 +117,61 @@ impl SparseMerkleTree {
         }
     }
 
+    /// Constructs a new Sparse Merkle Tree after applying bulk of updates from a sequence of
+    /// n transactions. Each update is of form (addr_hash, txn_id, blob), where 0 <= txn_id < n.
+    /// Since the tree is immutable, the existing tree will remain the same and may share
+    /// parts with the new, returned tree. Function also returns a vector of n-1 hashes, which
+    /// would be the intedmediate root hashes if we serially applied the updates of transactions.
+    pub fn bulk_update(
+        &self,
+        updates: Vec<(HashValue, usize, AccountStateBlob)>,
+        proof_reader: &impl ProofRead,
+    ) -> Result<(Self, Vec<HashValue>), UpdateError> {
+        let (root, hashes) = Self::bulk_update_existing_tree(Arc::clone(&self.root),
+                                                             0,
+                                                             &updates,
+                                                             (0..updates.len()).collect(),
+                                                             proof_reader)?;
+
+        
+        
+        Ok((SparseMerkleTree { root },
+            hashes.into_iter().skip(1).map(|(_, hash)| hash).collect()))
+    }
+
+    /// Returns the new subtree and a vector of pairs (txn_num, hash_value), where hash_value
+    /// would be the hash of the root of the subtree if only first txn_num many transactions
+    /// were applied. Only relevant txn_num values are included (i.e. if a transaction didn't
+    /// affect the given subtree, it will be skipped).
+    fn bulk_update_existing_tree(
+        subtree_root: Arc<SparseMerkleNode>,
+        subtree_depth: usize,
+        updates: &Vec<(HashValue, usize, AccountStateBlob)>,
+        subtree_update_indices: Vec<usize>,
+        _proof_reader: &impl ProofRead,
+    ) -> Result<(Arc<SparseMerkleNode>, Vec<(usize, HashValue)>), UpdateError> {
+        if subtree_update_indices.len() == 0 {
+            let subtree_hash = subtree_root.read_lock().hash();
+            return Ok((subtree_root, vec![(0, subtree_hash)]));
+        }
+
+        // If it's leaf or empty, call construct bulk and return its result (can be joined).
+        // construct bulk should take a list of leaves and siblings (and hashes and such)
+        // so we can also use it below.
+        
+        let (left_indices, right_indices) : (Vec<usize>,Vec<usize>) = subtree_update_indices
+            .into_iter()
+            .partition(|&index| updates[index].0.get_bit(subtree_depth));
+
+        // Otherwise, it's internal or subtree. if internal, two calls, merge.
+        // If subtree, identify all relevant leaves and siblings, and construct that tree.
+        // siblings should be used to have the 0-hash value, or empty.
+        // The two calls will be threaded and joined.
+
+        // Return value should actually be (txn_id, hash) pairs and pointer.
+        Ok((subtree_root, vec![]))
+    }
+    
     /// Constructs a new Sparse Merkle Tree as if we are updating the existing tree. Since the tree
     /// is immutable, the existing tree will remain the same and may share part of the tree with
     /// the new one.

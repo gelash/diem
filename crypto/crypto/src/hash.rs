@@ -249,7 +249,7 @@ impl HashValue {
 
     /// Returns the `index`-th nibble.
     pub fn get_nibble(&self, index: usize) -> Nibble {
-        precondition!(index < HashValue::LENGTH);
+        precondition!(index < HashValue::LENGTH_IN_NIBBLES);
         Nibble::from(if index % 2 == 0 {
             self[index / 2] >> 4
         } else {
@@ -257,6 +257,12 @@ impl HashValue {
         })
     }
 
+    /// Returns the `index`-th nibble.
+    pub fn get_bit(&self, index: usize) -> bool {
+        precondition!(index < HashValue::LENGTH_IN_BITS);
+        self[index / 8] & (1 << (7 - index % 8)) > 0
+    }
+    
     /// Returns first 4 bytes as hex-formatted string
     pub fn short_str(&self) -> ShortHexStr {
         const_assert!(HashValue::LENGTH >= ShortHexStr::SOURCE_LENGTH);
