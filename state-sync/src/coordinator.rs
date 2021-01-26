@@ -8,7 +8,7 @@ use crate::{
     counters,
     executor_proxy::ExecutorProxyTrait,
     logging::{LogEntry, LogEvent, LogSchema},
-    network::{StateSyncEvents, StateSyncSender, StateSynchronizerMsg},
+    network::{StateSyncEvents, StateSyncMessage, StateSyncSender},
     request_manager::RequestManager,
 };
 use anyhow::{bail, ensure, format_err, Result};
@@ -304,13 +304,9 @@ impl<T: ExecutorProxyTrait> StateSyncCoordinator<T> {
         }
     }
 
-    pub(crate) async fn process_one_message(
-        &mut self,
-        peer: PeerNetworkId,
-        msg: StateSynchronizerMsg,
-    ) {
+    pub(crate) async fn process_one_message(&mut self, peer: PeerNetworkId, msg: StateSyncMessage) {
         match msg {
-            StateSynchronizerMsg::GetChunkRequest(request) => {
+            StateSyncMessage::GetChunkRequest(request) => {
                 let _timer = counters::PROCESS_MSG_LATENCY
                     .with_label_values(&[
                         &peer.raw_network_id().to_string(),
@@ -339,7 +335,7 @@ impl<T: ExecutorProxyTrait> StateSyncCoordinator<T> {
                     ])
                     .inc();
             }
-            StateSynchronizerMsg::GetChunkResponse(response) => {
+            StateSyncMessage::GetChunkResponse(response) => {
                 let _timer = counters::PROCESS_MSG_LATENCY
                     .with_label_values(&[
                         &peer.raw_network_id().to_string(),
@@ -389,7 +385,7 @@ impl<T: ExecutorProxyTrait> StateSyncCoordinator<T> {
     /// The caller will be notified about request completion via request.callback oneshot:
     /// at that moment it's guaranteed that the highest LI exposed by the storage is equal to the
     /// target LI.
-    /// StateSynchronizer assumes that it's the only one modifying the storage (consensus is not
+    /// State sync assumes that it's the only one modifying the storage (consensus is not
     /// trying to commit transactions concurrently).
     fn request_sync(&mut self, request: SyncRequest) -> Result<()> {
         fail_point!("state_sync::request_sync", |_| {
@@ -769,7 +765,7 @@ impl<T: ExecutorProxyTrait> StateSyncCoordinator<T> {
         let log = LogSchema::event_log(LogEntry::ProcessChunkRequest, LogEvent::DeliverChunk)
             .chunk_response(chunk_response.clone())
             .peer(&peer);
-        let msg = StateSynchronizerMsg::GetChunkResponse(Box::new(chunk_response));
+        let msg = StateSyncMessage::GetChunkResponse(Box::new(chunk_response));
 
         let network_sender = self
             .network_senders
@@ -1132,7 +1128,7 @@ impl<T: ExecutorProxyTrait> StateSyncCoordinator<T> {
             .execute_chunk(txn_list_with_proof, target, intermediate_end_of_epoch_li)
     }
 
-    /// Ensures that StateSynchronizer is making progress:
+    /// Ensures that state sync is making progress:
     /// * kick-starts initial sync process (= initialization syncing to waypoint)
     /// * issue a new request if too much time passed since requesting highest_synced_version + 1.
     fn check_progress(&mut self) {
