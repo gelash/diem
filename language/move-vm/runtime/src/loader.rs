@@ -4,8 +4,8 @@
 use crate::{logging::LogContext, native_functions::NativeFunction};
 use bytecode_verifier::{
     constants, instantiation_loops::InstantiationLoopChecker, verify_main_signature,
-    CodeUnitVerifier, DependencyChecker, DuplicationChecker, InstructionConsistency,
-    RecursiveStructDefChecker, ResourceTransitiveChecker, SignatureChecker,
+    CodeUnitVerifier, CyclicModuleDependencyChecker, DependencyChecker, DuplicationChecker,
+    InstructionConsistency, RecursiveStructDefChecker, ResourceTransitiveChecker, SignatureChecker,
 };
 use diem_crypto::HashValue;
 use diem_infallible::Mutex;
@@ -500,7 +500,7 @@ impl Loader {
         match self.verify_script(&script) {
             Ok(_) => {
                 // verify dependencies
-                let deps = script_dependencies(&script);
+                let deps = script.immediate_module_dependencies();
                 let loaded_deps = self.load_dependencies_verify_no_missing_dependencies(
                     deps,
                     data_store,
@@ -590,6 +590,10 @@ impl Loader {
         data_store: &mut impl DataStore,
         log_context: &impl LogContext,
     ) -> VMResult<()> {
+        // Performs all verification steps to load the module without loading it, i.e., the new
+        // module will NOT show up in `module_cache`. In the module republishing case, it means
+        // that the old module is still in the `module_cache`, unless a new Loader is created,
+        // which means that a new MoveVM instance needs to be created.
         self.verify_module(module, data_store, true, log_context)
     }
 
@@ -619,7 +623,7 @@ impl Loader {
         CodeUnitVerifier::verify_module(&module)?;
         Self::check_natives(&module)?;
 
-        let deps = module_dependencies(&module);
+        let deps = module.immediate_module_dependencies();
         let loaded_deps = if verify_no_missing_modules {
             self.load_dependencies_verify_no_missing_dependencies(deps, data_store, log_context)?
         } else {
@@ -638,7 +642,12 @@ impl Loader {
         for dep in &dependencies {
             deps.push(dep.module());
         }
-        DependencyChecker::verify_module(module, deps)
+        DependencyChecker::verify_module(module, deps)?;
+        CyclicModuleDependencyChecker::verify_module(module, |module_id| {
+            self.get_module(module_id)
+                .module()
+                .immediate_module_dependencies()
+        })
     }
 
     // All native functions must be known to the loader
@@ -1662,32 +1671,6 @@ struct FieldInstantiation {
 //
 // Utility functions
 //
-
-fn script_dependencies(script: &CompiledScript) -> Vec<ModuleId> {
-    let mut deps = vec![];
-    for module in script.module_handles() {
-        deps.push(ModuleId::new(
-            *script.address_identifier_at(module.address),
-            script.identifier_at(module.name).to_owned(),
-        ));
-    }
-    deps
-}
-
-fn module_dependencies(module: &CompiledModule) -> Vec<ModuleId> {
-    let self_module = module.self_handle();
-    let mut deps = vec![];
-    for module_handle in module.module_handles() {
-        if module_handle == self_module {
-            continue;
-        }
-        deps.push(ModuleId::new(
-            *module.address_identifier_at(module_handle.address),
-            module.identifier_at(module_handle.name).to_owned(),
-        ));
-    }
-    deps
-}
 
 fn expect_no_verification_errors(err: VMError, log_context: &impl LogContext) -> VMError {
     match err.status_type() {

@@ -183,6 +183,15 @@ pub trait ModuleAccess: Sync {
     fn self_id(&self) -> ModuleId {
         self.as_module().self_id()
     }
+
+    fn immediate_module_dependencies(&self) -> Vec<ModuleId> {
+        let self_handle = self.self_handle();
+        self.module_handles()
+            .iter()
+            .filter(|&handle| handle != self_handle)
+            .map(|handle| self.module_id_for_handle(handle))
+            .collect()
+    }
 }
 
 /// Represents accessors for a compiled script.
@@ -258,6 +267,18 @@ pub trait ScriptAccess: Sync {
 
     fn code(&self) -> &CodeUnit {
         &self.as_script().as_inner().code
+    }
+
+    fn immediate_module_dependencies(&self) -> Vec<ModuleId> {
+        self.module_handles()
+            .iter()
+            .map(|handle| {
+                ModuleId::new(
+                    *self.address_identifier_at(handle.address),
+                    self.identifier_at(handle.name).to_owned(),
+                )
+            })
+            .collect()
     }
 }
 

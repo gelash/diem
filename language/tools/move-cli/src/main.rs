@@ -19,7 +19,7 @@ use move_lang::{self, compiled_unit::CompiledUnit};
 use move_vm_runtime::{data_cache::TransactionEffects, logging::NoContextLog, move_vm::MoveVM};
 use move_vm_types::{gas_schedule::CostStrategy, values::Value};
 use vm::{
-    access::ScriptAccess,
+    access::{ModuleAccess, ScriptAccess},
     compatibility::Compatibility,
     errors::VMError,
     file_format::{CompiledModule, CompiledScript, SignatureToken},
@@ -28,6 +28,7 @@ use vm::{
 
 use anyhow::{bail, Result};
 use std::{
+    collections::BTreeMap,
     ffi::OsStr,
     fs,
     path::{Path, PathBuf},
@@ -608,6 +609,52 @@ fn explain_publish_error(
                 println!("Linking API for structs/functions of module {} has changed. Need to redeploy all dependent modules.", module_id)
             }
         }
+        VMStatus::Error(CYCLIC_MODULE_DEPENDENCY) => {
+            println!(
+                "Publishing module {} introduces cyclic dependencies.",
+                module_id
+            );
+            // find all cycles with an iterative DFS
+            let all_modules = state.get_all_modules()?;
+
+            let mut stack = vec![];
+            let mut state = BTreeMap::new();
+            state.insert(module_id.clone(), true);
+            for dep in module.immediate_module_dependencies() {
+                stack.push((all_modules.get(&dep).unwrap(), false));
+            }
+
+            while !stack.is_empty() {
+                let (cur, is_exit) = stack.pop().unwrap();
+                let cur_id = cur.self_id();
+                if is_exit {
+                    state.insert(cur_id, false);
+                } else {
+                    state.insert(cur_id, true);
+                    stack.push((cur, true));
+                    for next in cur.immediate_module_dependencies() {
+                        if let Some(is_discovered_but_not_finished) = state.get(&next) {
+                            if *is_discovered_but_not_finished {
+                                let cycle_path: Vec<_> = stack
+                                    .iter()
+                                    .filter(|(_, is_exit)| *is_exit)
+                                    .map(|(m, _)| m.self_id().to_string())
+                                    .collect();
+                                println!(
+                                    "Cycle detected: {} -> {} -> {}",
+                                    module_id,
+                                    cycle_path.join(" -> "),
+                                    module_id,
+                                );
+                            }
+                        } else {
+                            stack.push((all_modules.get(&next).unwrap(), false));
+                        }
+                    }
+                }
+            }
+            println!("Re-run with --ignore-breaking-changes to publish anyway.")
+        }
         VMStatus::Error(status_code) => {
             println!("Publishing failed with unexpected error {:?}", status_code)
         }
@@ -770,6 +817,19 @@ fn doctor(state: OnDiskStateView) -> Result<()> {
         if bytecode_verifier::DependencyChecker::verify_module(module, modules.values()).is_err() {
             bail!(
                 "Failed to link module {:?} against its dependencies",
+                module.self_id()
+            )
+        }
+        let cyclic_check_result =
+            bytecode_verifier::CyclicModuleDependencyChecker::verify_module(module, |module_id| {
+                modules
+                    .get(module_id)
+                    .expect("Missing dependencies in cyclic checker is unexpected")
+                    .immediate_module_dependencies()
+            });
+        if cyclic_check_result.is_err() {
+            bail!(
+                "Cyclic module dependencies are detected with module {} in the loop",
                 module.self_id()
             )
         }

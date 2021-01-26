@@ -1,0 +1,50 @@
+Command `publish src1 -v`:
+Compiling Move modules...
+Found and compiled 2 modules
+Publishing a new module 00000000000000000000000000000042::M
+Publishing a new module 00000000000000000000000000000043::N
+Command `view storage/0x00000000000000000000000000000042/modules/M.mv`:
+module 42.M {
+
+
+public foo() {
+	0: Call[0](bar())
+	1: Ret
+}
+}
+Command `view storage/0x00000000000000000000000000000043/modules/N.mv`:
+module 43.N {
+
+
+public bar() {
+	0: Ret
+}
+}
+Command `publish src2 -v`:
+Compiling Move modules...
+Found and compiled 1 modules
+Publishing module 00000000000000000000000000000043::N introduces cyclic dependencies.
+Cycle detected: 00000000000000000000000000000043::N -> 00000000000000000000000000000042::M -> 00000000000000000000000000000043::N
+Re-run with --ignore-breaking-changes to publish anyway.
+Command `view storage/0x00000000000000000000000000000042/modules/M.mv`:
+module 42.M {
+
+
+public foo() {
+	0: Call[0](bar())
+	1: Ret
+}
+}
+Command `view storage/0x00000000000000000000000000000043/modules/N.mv`:
+module 43.N {
+
+
+public bar() {
+	0: Ret
+}
+}
+Command `publish src2 -v --ignore-breaking-changes`:
+Compiling Move modules...
+Found and compiled 1 modules
+Command `doctor`:
+Error: Cyclic module dependencies are detected with module 00000000000000000000000000000042::M in the loop
