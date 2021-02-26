@@ -10,11 +10,11 @@ use crate::{
     dataflow_analysis::{AbstractDomain, DataflowAnalysis, JoinResult, TransferFunctions},
     function_target::{FunctionData, FunctionTarget},
     function_target_pipeline::{FunctionTargetProcessor, FunctionTargetsHolder},
-    stackless_bytecode::{BorrowNode, Bytecode, Operation, TempIndex},
+    stackless_bytecode::{AbortAction, BorrowNode, Bytecode, Operation},
     stackless_control_flow_graph::StacklessControlFlowGraph,
 };
 use itertools::Itertools;
-use move_model::model::FunctionEnv;
+use move_model::{ast::TempIndex, model::FunctionEnv};
 use std::collections::{BTreeMap, BTreeSet};
 use vm::file_format::CodeOffset;
 
@@ -97,17 +97,16 @@ impl ReachingDefProcessor {
         res
     }
 
-    /// Compute the set of locals which are borrowed from. We can't alias such locals
-    /// to other locals because of reference semantics.
+    /// Compute the set of locals which are borrowed from or which are otherwise used to refer to.
+    /// We can't alias such locals to other locals because of reference semantics.
     fn borrowed_locals(&self, code: &[Bytecode]) -> BTreeSet<TempIndex> {
         use Bytecode::*;
         code.iter()
-            .filter_map(|bc| {
-                if let Call(_, _, Operation::BorrowLoc, srcs) = bc {
-                    Some(srcs[0])
-                } else {
-                    None
-                }
+            .filter_map(|bc| match bc {
+                Call(_, _, Operation::BorrowLoc, srcs, _) => Some(srcs[0]),
+                Call(_, _, Operation::WriteBack(BorrowNode::LocalRoot(src), _), ..) => Some(*src),
+                Call(_, _, Operation::WriteBack(BorrowNode::Reference(src), _), ..) => Some(*src),
+                _ => None,
             })
             .collect()
     }
@@ -213,15 +212,17 @@ impl<'a> TransferFunctions for ReachingDefAnalysis<'a> {
             Load(_, dest, ..) => {
                 state.kill(*dest);
             }
-            Call(_, dests, oper, ..) => {
-                if let WriteBack(LocalRoot(dest)) = oper {
+            Call(_, dests, oper, _, on_abort) => {
+                if let WriteBack(LocalRoot(dest), _) = oper {
                     state.kill(*dest);
                 }
                 for dest in dests {
                     state.kill(*dest);
                 }
+                if let Some(AbortAction(_, dest)) = on_abort {
+                    state.kill(*dest);
+                }
             }
-            OnAbort(_, _, code_dest) => state.kill(*code_dest),
             _ => {}
         }
     }

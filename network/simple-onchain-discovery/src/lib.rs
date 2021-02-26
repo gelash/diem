@@ -2,14 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use channel::diem_channel::{self, Receiver};
-use diem_config::{config::RoleType, network_id::NetworkContext};
-use diem_crypto::{x25519, x25519::PublicKey};
+use diem_config::{
+    config::{Peer, PeerRole},
+    network_id::NetworkContext,
+};
+use diem_crypto::x25519::PublicKey;
 use diem_logger::prelude::*;
 use diem_metrics::{
     register_histogram, register_int_counter_vec, register_int_gauge_vec, DurationHistogram,
     IntCounterVec, IntGaugeVec,
 };
-use diem_network_address::NetworkAddress;
 use diem_network_address_encryption::{Encryptor, Error as EncryptorError};
 use diem_types::on_chain_config::{OnChainConfigPayload, ValidatorSet, ON_CHAIN_CONFIG_REGISTRY};
 use futures::{sink::SinkExt, StreamExt};
@@ -19,10 +21,8 @@ use network::{
     logging::NetworkSchema,
 };
 use once_cell::sync::Lazy;
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use short_hex_str::AsShortHexStr;
+use std::{collections::HashSet, sync::Arc};
 use subscription_service::ReconfigSubscription;
 
 pub mod builder;
@@ -88,29 +88,28 @@ fn extract_updates(
     encryptor: &Encryptor,
     node_set: ValidatorSet,
 ) -> Vec<ConnectivityRequest> {
-    let role = network_context.role();
+    let is_validator = network_context.network_id().is_validator_network();
 
     // Decode addresses while ignoring bad addresses
-    let new_peer_addrs: HashMap<_, _> = node_set
+    let discovered_peers = node_set
         .into_iter()
         .map(|info| {
             let peer_id = *info.account_address();
             let config = info.into_config();
 
-            let addrs = match role {
-                RoleType::Validator => {
-                    let result = encryptor.decrypt(&config.validator_network_addresses, peer_id);
-                    if let Err(EncryptorError::StorageError(_)) = result {
-                        panic!(format!(
-                            "Unable to initialize validator network addresses: {:?}",
-                            result
-                        ));
-                    }
-                    result.map_err(anyhow::Error::from)
+            let addrs = if is_validator {
+                let result = encryptor.decrypt(&config.validator_network_addresses, peer_id);
+                if let Err(EncryptorError::StorageError(_)) = result {
+                    panic!(format!(
+                        "Unable to initialize validator network addresses: {:?}",
+                        result
+                    ));
                 }
-                RoleType::FullNode => config
+                result.map_err(anyhow::Error::from)
+            } else {
+                config
                     .fullnode_network_addresses()
-                    .map_err(anyhow::Error::from),
+                    .map_err(anyhow::Error::from)
             }
             .map_err(|err| {
                 inc_by_with_context(&DISCOVERY_COUNTS, &network_context, "read_failure", 1);
@@ -124,26 +123,19 @@ fn extract_updates(
             })
             .unwrap_or_default();
 
-            (peer_id, addrs)
+            let peer_role = if is_validator {
+                PeerRole::Validator
+            } else {
+                PeerRole::ValidatorFullNode
+            };
+            (peer_id, Peer::from_addrs(peer_role, addrs))
         })
         .collect();
 
-    // Retrieve public keys from addresses
-    let new_peer_pubkeys: HashMap<_, _> = new_peer_addrs
-        .iter()
-        .map(|(peer_id, addrs)| {
-            let pubkeys: HashSet<x25519::PublicKey> = addrs
-                .iter()
-                .filter_map(NetworkAddress::find_noise_proto)
-                .collect();
-            (*peer_id, pubkeys)
-        })
-        .collect();
-
-    vec![
-        ConnectivityRequest::UpdateAddresses(DiscoverySource::OnChain, new_peer_addrs),
-        ConnectivityRequest::UpdateEligibleNodes(DiscoverySource::OnChain, new_peer_pubkeys),
-    ]
+    vec![ConnectivityRequest::UpdateDiscoveredPeers(
+        DiscoverySource::OnChain,
+        discovered_peers,
+    )]
 }
 
 impl ConfigurationChangeListener {
@@ -169,6 +161,30 @@ impl ConfigurationChangeListener {
         self.reconfig_events.next().await
     }
 
+    fn find_key_mismatches(&self, onchain_keys: Option<&HashSet<PublicKey>>) {
+        let mismatch = onchain_keys.map_or(0, |pubkeys| {
+            if !pubkeys.contains(&self.expected_pubkey) {
+                error!(
+                    NetworkSchema::new(&self.network_context),
+                    "Onchain pubkey {:?} differs from local pubkey {}",
+                    pubkeys,
+                    self.expected_pubkey
+                );
+                1
+            } else {
+                0
+            }
+        });
+
+        NETWORK_KEY_MISMATCH
+            .with_label_values(&[
+                self.network_context.role().as_str(),
+                self.network_context.network_id().as_str(),
+                self.network_context.peer_id().short_str().as_str(),
+            ])
+            .set(mismatch);
+    }
+
     /// Processes a received OnChainConfigPayload. Depending on role (Validator or FullNode), parses
     /// the appropriate configuration changes and passes it to the ConnectionManager channel.
     async fn process_payload(&mut self, payload: OnChainConfigPayload) {
@@ -181,34 +197,15 @@ impl ConfigurationChangeListener {
         let updates = extract_updates(self.network_context.clone(), &self.encryptor, node_set);
 
         // Ensure that the public key matches what's onchain for this peer
-        if let Some(ConnectivityRequest::UpdateEligibleNodes(_, peer_updates)) = updates
-            .iter()
-            .find(|requests| matches!(requests, ConnectivityRequest::UpdateEligibleNodes(_, _)))
-        {
-            let mismatch = peer_updates
-                .get(&self.network_context.peer_id())
-                .map_or(0, |pubkeys| {
-                    if !pubkeys.contains(&self.expected_pubkey) {
-                        error!(
-                            NetworkSchema::new(&self.network_context),
-                            "Onchain pubkey {:?} differs from local pubkey {}",
-                            pubkeys,
-                            self.expected_pubkey
-                        );
-                        1
-                    } else {
-                        0
-                    }
-                });
-
-            NETWORK_KEY_MISMATCH
-                .with_label_values(&[
-                    self.network_context.role().as_str(),
-                    self.network_context.network_id().as_str(),
-                    self.network_context.peer_id().short_str().as_str(),
-                ])
-                .set(mismatch);
-        };
+        for request in &updates {
+            if let ConnectivityRequest::UpdateDiscoveredPeers(_, peer_updates) = request {
+                self.find_key_mismatches(
+                    peer_updates
+                        .get(&self.network_context.peer_id())
+                        .map(|peer| &peer.keys),
+                )
+            }
+        }
 
         inc_by_with_context(
             &DISCOVERY_COUNTS,
@@ -219,7 +216,7 @@ impl ConfigurationChangeListener {
         info!(
             NetworkSchema::new(&self.network_context),
             "Update {} Network about new Node IDs",
-            self.network_context.role()
+            self.network_context.network_id()
         );
 
         for update in updates {
@@ -269,12 +266,12 @@ mod tests {
         PrivateKey as PK, Uniform,
     };
     use diem_types::{
-        on_chain_config::OnChainConfig, validator_config::ValidatorConfig,
-        validator_info::ValidatorInfo, PeerId,
+        network_address::NetworkAddress, on_chain_config::OnChainConfig,
+        validator_config::ValidatorConfig, validator_info::ValidatorInfo, PeerId,
     };
     use futures::executor::block_on;
     use rand::{rngs::StdRng, SeedableRng};
-    use std::time::Instant;
+    use std::{collections::HashMap, time::Instant};
     use tokio::{
         runtime::Runtime,
         time::{timeout_at, Duration},
@@ -288,7 +285,7 @@ mod tests {
         let consensus_pubkey = consensus_private_key.public_key();
         let pubkey = test_pubkey([0u8; 32]);
         let different_pubkey = test_pubkey([1u8; 32]);
-        let peer_id = PeerId::from_identity_public_key(pubkey);
+        let peer_id = diem_types::account_address::from_identity_public_key(pubkey);
 
         // Build up the Reconfig Listener
         let (conn_mgr_reqs_tx, _rx) = channel::new_test(1);

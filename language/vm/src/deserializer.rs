@@ -263,10 +263,15 @@ fn deserialize_compiled_script(binary: &[u8]) -> BinaryLoaderResult<CompiledScri
         content_len as usize,
     )?;
 
-    let mut script = CompiledScriptMut::default();
-    script.type_parameters = load_kinds(&mut cursor)?;
-    script.parameters = load_signature_index(&mut cursor)?;
-    script.code = load_code_unit(&mut cursor)?;
+    let mut script = CompiledScriptMut {
+        type_parameters: load_ability_sets(
+            &mut cursor,
+            AbilitySetPosition::FunctionTypeParameters,
+        )?,
+        parameters: load_signature_index(&mut cursor)?,
+        code: load_code_unit(&mut cursor)?,
+        ..Default::default()
+    };
 
     build_compiled_script(&mut script, &table_contents, &tables)?;
 
@@ -289,8 +294,10 @@ fn deserialize_compiled_module(binary: &[u8]) -> BinaryLoaderResult<CompiledModu
         content_len as usize,
     )?;
 
-    let mut module = CompiledModuleMut::default();
-    module.self_module_handle_idx = load_module_handle_index(&mut cursor)?;
+    let mut module = CompiledModuleMut {
+        self_module_handle_idx: load_module_handle_index(&mut cursor)?,
+        ..Default::default()
+    };
 
     build_compiled_module(&mut module, &table_contents, &tables)?;
 
@@ -508,6 +515,15 @@ fn build_common_tables(
             | TableType::STRUCT_DEF_INST
             | TableType::FIELD_HANDLE
             | TableType::FIELD_INST => continue,
+            TableType::FRIEND_DECLS => {
+                // friend declarations do not exist before VERSION_2
+                if binary.version() < VERSION_2 {
+                    return Err(PartialVMError::new(StatusCode::MALFORMED).with_message(
+                        "Friend declarations not applicable in bytecode version 1".to_string(),
+                    ));
+                }
+                continue;
+            }
         }
     }
     Ok(())
@@ -535,6 +551,9 @@ fn build_module_tables(
             }
             TableType::FIELD_INST => {
                 load_field_instantiations(binary, table, &mut module.field_instantiations)?;
+            }
+            TableType::FRIEND_DECLS => {
+                load_module_handles(binary, table, &mut module.friend_decls)?;
             }
             TableType::MODULE_HANDLES
             | TableType::STRUCT_HANDLES
@@ -573,7 +592,8 @@ fn build_script_tables(
             | TableType::STRUCT_DEF_INST
             | TableType::FUNCTION_DEFS
             | TableType::FIELD_INST
-            | TableType::FIELD_HANDLE => {
+            | TableType::FIELD_HANDLE
+            | TableType::FRIEND_DECLS => {
                 return Err(PartialVMError::new(StatusCode::MALFORMED)
                     .with_message("Bad table in Script".to_string()));
             }
@@ -611,12 +631,13 @@ fn load_struct_handles(
     while cursor.position() < table.count as u64 {
         let module = load_module_handle_index(&mut cursor)?;
         let name = load_identifier_index(&mut cursor)?;
-        let is_nominal_resource = load_nominal_resource_flag(&mut cursor)?;
-        let type_parameters = load_kinds(&mut cursor)?;
+        let abilities = load_ability_set(&mut cursor, AbilitySetPosition::StructHandle)?;
+        let type_parameters =
+            load_ability_sets(&mut cursor, AbilitySetPosition::StructTypeParameters)?;
         struct_handles.push(StructHandle {
             module,
             name,
-            is_nominal_resource,
+            abilities,
             type_parameters,
         });
     }
@@ -637,7 +658,8 @@ fn load_function_handles(
         let name = load_identifier_index(&mut cursor)?;
         let parameters = load_signature_index(&mut cursor)?;
         let return_ = load_signature_index(&mut cursor)?;
-        let type_parameters = load_kinds(&mut cursor)?;
+        let type_parameters =
+            load_ability_sets(&mut cursor, AbilitySetPosition::FunctionTypeParameters)?;
 
         function_handles.push(FunctionHandle {
             module,
@@ -802,10 +824,7 @@ fn load_signature_tokens(cursor: &mut VersionedCursor) -> BinaryLoaderResult<Vec
 pub fn load_signature_token_test_entry(
     cursor: std::io::Cursor<&[u8]>,
 ) -> BinaryLoaderResult<SignatureToken> {
-    load_signature_token(&mut VersionedCursor::new_for_test(
-        versioned_data::MAX_VERSION,
-        cursor,
-    ))
+    load_signature_token(&mut VersionedCursor::new_for_test(VERSION_MAX, cursor))
 }
 
 /// Deserializes a `SignatureToken`.
@@ -947,34 +966,85 @@ fn load_signature_token(cursor: &mut VersionedCursor) -> BinaryLoaderResult<Sign
     }
 }
 
-fn load_nominal_resource_flag(cursor: &mut VersionedCursor) -> BinaryLoaderResult<bool> {
-    if let Ok(byte) = cursor.read_u8() {
-        Ok(match SerializedNominalResourceFlag::from_u8(byte)? {
-            SerializedNominalResourceFlag::NOMINAL_RESOURCE => true,
-            SerializedNominalResourceFlag::NORMAL_STRUCT => false,
-        })
+#[derive(Copy, Clone)]
+enum AbilitySetPosition {
+    FunctionTypeParameters,
+    StructTypeParameters,
+    StructHandle,
+}
+
+fn load_ability_set(
+    cursor: &mut VersionedCursor,
+    pos: AbilitySetPosition,
+) -> BinaryLoaderResult<AbilitySet> {
+    // If the module was on the old kind system:
+    // - For struct declarations
+    //   - resource kind structs become store+resource structs
+    //   - copyable kind structs become store+copy+drop structs
+    // - For function type parameter constraints
+    //   - all kind becomes store, since it might be used in global storage
+    //   - resource kind becomes store+resource
+    //   - copyable kind becomes store+copy+drop
+    // - For struct type parameter constraints
+    //   - all kind becomes empty
+    //   - resource kind becomes resource
+    //   - copyable kind becomes copy+drop
+    // In summary, we do not need store on the struct type parameter case for backwards
+    // compatibility because any old code paths or entry points will use them with store types.
+    // Any new code paths gain flexibility by being able to use the struct with possibly non-store
+    // instantiations
+    if cursor.version() < 2 {
+        let byte = match cursor.read_u8() {
+            Ok(byte) => byte,
+            Err(_) => {
+                return Err(PartialVMError::new(StatusCode::MALFORMED)
+                    .with_message("Unexpected EOF".to_string()))
+            }
+        };
+        match pos {
+            AbilitySetPosition::StructHandle => {
+                Ok(match DeprecatedNominalResourceFlag::from_u8(byte)? {
+                    DeprecatedNominalResourceFlag::NOMINAL_RESOURCE => {
+                        AbilitySet::EMPTY | Ability::Store | Ability::Key
+                    }
+                    DeprecatedNominalResourceFlag::NORMAL_STRUCT => {
+                        AbilitySet::EMPTY | Ability::Store | Ability::Copy | Ability::Drop
+                    }
+                })
+            }
+            AbilitySetPosition::FunctionTypeParameters
+            | AbilitySetPosition::StructTypeParameters => {
+                let set = match DeprecatedKind::from_u8(byte)? {
+                    DeprecatedKind::ALL => AbilitySet::EMPTY,
+                    DeprecatedKind::COPYABLE => AbilitySet::EMPTY | Ability::Copy | Ability::Drop,
+                    DeprecatedKind::RESOURCE => AbilitySet::EMPTY | Ability::Key,
+                };
+                Ok(match pos {
+                    AbilitySetPosition::StructHandle => unreachable!(),
+                    AbilitySetPosition::FunctionTypeParameters => set | Ability::Store,
+                    AbilitySetPosition::StructTypeParameters => set,
+                })
+            }
+        }
     } else {
-        Err(PartialVMError::new(StatusCode::MALFORMED).with_message("Unexpected EOF".to_string()))
+        // The uleb here doesn't really do anything as it is bounded currently to 0xF, but the
+        // if we get many more constraints in the future, uleb will be helpful.
+        let u = read_uleb_internal(cursor, AbilitySet::ALL.into_u8() as u64)?;
+        match AbilitySet::from_u8(u) {
+            Some(abilities) => Ok(abilities),
+            None => Err(PartialVMError::new(StatusCode::UNKNOWN_ABILITY)),
+        }
     }
 }
 
-fn load_kind(cursor: &mut VersionedCursor) -> BinaryLoaderResult<Kind> {
-    if let Ok(byte) = cursor.read_u8() {
-        Ok(match SerializedKind::from_u8(byte)? {
-            SerializedKind::ALL => Kind::All,
-            SerializedKind::COPYABLE => Kind::Copyable,
-            SerializedKind::RESOURCE => Kind::Resource,
-        })
-    } else {
-        Err(PartialVMError::new(StatusCode::MALFORMED).with_message("Unexpected EOF".to_string()))
-    }
-}
-
-fn load_kinds(cursor: &mut VersionedCursor) -> BinaryLoaderResult<Vec<Kind>> {
+fn load_ability_sets(
+    cursor: &mut VersionedCursor,
+    pos: AbilitySetPosition,
+) -> BinaryLoaderResult<Vec<AbilitySet>> {
     let len = load_type_parameter_count(cursor)?;
     let mut kinds = vec![];
     for _ in 0..len {
-        kinds.push(load_kind(cursor)?);
+        kinds.push(load_ability_set(cursor, pos)?);
     }
     Ok(kinds)
 }
@@ -1094,19 +1164,60 @@ fn load_field_instantiations(
 fn load_function_def(cursor: &mut VersionedCursor) -> BinaryLoaderResult<FunctionDefinition> {
     let function = load_function_handle_index(cursor)?;
 
-    let flags = cursor.read_u8().map_err(|_| {
+    let mut flags = cursor.read_u8().map_err(|_| {
         PartialVMError::new(StatusCode::MALFORMED).with_message("Unexpected EOF".to_string())
     })?;
-    let is_public = (flags & FunctionDefinition::PUBLIC) != 0;
+
+    let (visibility, mut extra_flags) = match cursor.version() {
+        VERSION_1 => {
+            let is_public_bit = Visibility::Public as u8;
+            let vis = if (flags & is_public_bit) != 0 {
+                flags ^= is_public_bit;
+                Visibility::Public
+            } else {
+                Visibility::Private
+            };
+            (vis, flags)
+        }
+        VERSION_2 => {
+            // NOTE: changes compared with VERSION_1
+            // - in VERSION_1: the flags is a byte compositing both the visibility info and whether
+            //                 the function is a native function
+            // - in VERSION_2: the flags only represent the visibility info and we need to advance
+            //                 the cursor to read up the next byte as flags
+            let vis = flags.try_into().map_err(|_| {
+                PartialVMError::new(StatusCode::MALFORMED)
+                    .with_message("Invalid visibility byte".to_string())
+            })?;
+            let extra_flags = cursor.read_u8().map_err(|_| {
+                PartialVMError::new(StatusCode::MALFORMED)
+                    .with_message("Unexpected EOF".to_string())
+            })?;
+            (vis, extra_flags)
+        }
+        _ => {
+            return Err(PartialVMError::new(StatusCode::UNREACHABLE)
+                .with_message(String::from("Invalid bytecode version")))
+        }
+    };
+
     let acquires_global_resources = load_struct_definition_indices(cursor)?;
-    let code_unit = if (flags & FunctionDefinition::NATIVE) != 0 {
+    let code_unit = if (extra_flags & FunctionDefinition::NATIVE) != 0 {
+        extra_flags ^= FunctionDefinition::NATIVE;
         None
     } else {
         Some(load_code_unit(cursor)?)
     };
+
+    // check that the bits unused in the flags are not set, otherwise it might cause some trouble
+    // if later we decide to assign meaning to these bits.
+    if extra_flags != 0 {
+        return Err(PartialVMError::new(StatusCode::INVALID_FLAG_BITS));
+    }
+
     Ok(FunctionDefinition {
         function,
-        is_public,
+        visibility,
         acquires_global_resources,
         code: code_unit,
     })
@@ -1255,6 +1366,7 @@ impl TableType {
             0xC => Ok(TableType::FUNCTION_DEFS),
             0xD => Ok(TableType::FIELD_HANDLE),
             0xE => Ok(TableType::FIELD_INST),
+            0xF => Ok(TableType::FRIEND_DECLS),
             _ => Err(PartialVMError::new(StatusCode::UNKNOWN_TABLE_TYPE)),
         }
     }
@@ -1280,23 +1392,40 @@ impl SerializedType {
     }
 }
 
-impl SerializedNominalResourceFlag {
-    fn from_u8(value: u8) -> BinaryLoaderResult<SerializedNominalResourceFlag> {
+#[rustfmt::skip]
+#[allow(non_camel_case_types)]
+#[repr(u8)]
+#[derive(Clone, Copy, Debug)]
+pub enum DeprecatedNominalResourceFlag {
+    NOMINAL_RESOURCE        = 0x1,
+    NORMAL_STRUCT           = 0x2,
+}
+
+impl DeprecatedNominalResourceFlag {
+    fn from_u8(value: u8) -> BinaryLoaderResult<DeprecatedNominalResourceFlag> {
         match value {
-            0x1 => Ok(SerializedNominalResourceFlag::NOMINAL_RESOURCE),
-            0x2 => Ok(SerializedNominalResourceFlag::NORMAL_STRUCT),
-            _ => Err(PartialVMError::new(StatusCode::UNKNOWN_NOMINAL_RESOURCE)),
+            0x1 => Ok(DeprecatedNominalResourceFlag::NOMINAL_RESOURCE),
+            0x2 => Ok(DeprecatedNominalResourceFlag::NORMAL_STRUCT),
+            _ => Err(PartialVMError::new(StatusCode::UNKNOWN_ABILITY)),
         }
     }
 }
+#[rustfmt::skip]
+#[allow(non_camel_case_types)]
+#[repr(u8)]
+enum DeprecatedKind {
+    ALL                     = 0x1,
+    COPYABLE                = 0x2,
+    RESOURCE                = 0x3,
+}
 
-impl SerializedKind {
-    fn from_u8(value: u8) -> BinaryLoaderResult<SerializedKind> {
+impl DeprecatedKind {
+    fn from_u8(value: u8) -> BinaryLoaderResult<DeprecatedKind> {
         match value {
-            0x1 => Ok(SerializedKind::ALL),
-            0x2 => Ok(SerializedKind::COPYABLE),
-            0x3 => Ok(SerializedKind::RESOURCE),
-            _ => Err(PartialVMError::new(StatusCode::UNKNOWN_KIND)),
+            0x1 => Ok(DeprecatedKind::ALL),
+            0x2 => Ok(DeprecatedKind::COPYABLE),
+            0x3 => Ok(DeprecatedKind::RESOURCE),
+            _ => Err(PartialVMError::new(StatusCode::UNKNOWN_ABILITY)),
         }
     }
 }

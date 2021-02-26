@@ -256,12 +256,7 @@ fn module_(context: &mut Context, mdef: P::ModuleDefinition) -> (ModuleIdent, E:
                 function(context, &mut functions, f)
             }
             P::ModuleMember::Constant(c) => constant(context, &mut constants, c),
-            P::ModuleMember::Struct(mut s) => {
-                if !context.is_source_module {
-                    s.fields = P::StructFields::Native(s.loc)
-                }
-                struct_def(context, &mut structs, s)
-            }
+            P::ModuleMember::Struct(s) => struct_def(context, &mut structs, s),
             P::ModuleMember::Spec(s) => specs.push(spec(context, s)),
         }
     }
@@ -309,9 +304,16 @@ fn script_(context: &mut Context, pscript: P::Script) -> E::Script {
     }
 
     let (function_name, function) = function_(context, pfunction);
-    if let FunctionVisibility::Public(loc) = &function.visibility {
-        let msg = "Extraneous 'public' modifier. Script functions are always public";
-        context.error(vec![(*loc, msg)]);
+    match &function.visibility {
+        FunctionVisibility::Public(loc) | FunctionVisibility::Script(loc) => {
+            let msg = format!(
+                "Extraneous '{}' modifier. Script functions are always '{}'",
+                function.visibility,
+                FunctionVisibility::SCRIPT,
+            );
+            context.error(vec![(*loc, msg)]);
+        }
+        FunctionVisibility::Internal => (),
     }
     match &function.body {
         sp!(_, E::FunctionBody_::Defined(_)) => (),
@@ -377,7 +379,16 @@ fn module_members(
             P::ModuleMember::Struct(s) => {
                 cur_members.insert(s.name.0.clone(), ModuleMemberKind::Struct);
             }
-            P::ModuleMember::Spec(sp!(_, SB { target, members, .. })) => match &target.value {
+            P::ModuleMember::Spec(
+                sp!(
+                    _,
+                    SB {
+                        target,
+                        members,
+                        ..
+                    }
+                ),
+            ) => match &target.value {
                 SBT::Schema(n, _) => {
                     cur_members.insert(n.clone(), ModuleMemberKind::Schema);
                 }
@@ -442,7 +453,14 @@ fn aliases_from_member(
             Some(P::ModuleMember::Struct(s))
         }
         P::ModuleMember::Spec(s) => {
-            let sp!(_, SB { target, members, .. }) = &s;
+            let sp!(
+                _,
+                SB {
+                    target,
+                    members,
+                    ..
+                }
+            ) = &s;
             match &target.value {
                 SBT::Schema(n, _) => {
                     check_name_and_add_implicit_alias!(ModuleMemberKind::Schema, n.clone());
@@ -782,13 +800,7 @@ fn spec(context: &mut Context, sp!(loc, pspec): P::SpecBlock) -> E::SpecBlock {
 
     let members = pmembers
         .into_iter()
-        .filter_map(|m| {
-            let m = spec_member(context, m);
-            if m.is_none() {
-                assert!(context.has_errors())
-            };
-            m
-        })
+        .map(|m| spec_member(context, m))
         .collect();
 
     context.set_to_outer_scope(old_aliases);
@@ -797,10 +809,7 @@ fn spec(context: &mut Context, sp!(loc, pspec): P::SpecBlock) -> E::SpecBlock {
     sp(loc, E::SpecBlock_ { target, members })
 }
 
-fn spec_member(
-    context: &mut Context,
-    sp!(loc, pm): P::SpecBlockMember,
-) -> Option<E::SpecBlockMember> {
+fn spec_member(context: &mut Context, sp!(loc, pm): P::SpecBlockMember) -> E::SpecBlockMember {
     use E::SpecBlockMember_ as EM;
     use P::SpecBlockMember_ as PM;
     let em = match pm {
@@ -896,7 +905,7 @@ fn spec_member(
             EM::Pragma { properties }
         }
     };
-    Some(sp(loc, em))
+    sp(loc, em)
 }
 
 fn pragma_property(context: &mut Context, sp!(loc, pp_): P::PragmaProperty) -> E::PragmaProperty {
@@ -1190,16 +1199,20 @@ fn exp_(context: &mut Context, sp!(loc, pe_): P::Exp) -> E::Exp {
                 }
             }
         }
-        PE::Quant(k, prs, pc, pe) => {
+        PE::Quant(k, prs, ptrs, pc, pe) => {
             if !context.require_spec_context(loc, "expression only allowed in specifications") {
                 assert!(context.has_errors());
                 EE::UnresolvedError
             } else {
                 let rs_opt = bind_with_range_list(context, prs);
+                let rtrs = ptrs
+                    .into_iter()
+                    .map(|trs| trs.into_iter().map(|tr| exp_(context, tr)).collect())
+                    .collect();
                 let rc = pc.map(|c| Box::new(exp_(context, *c)));
                 let re = exp_(context, *pe);
                 match rs_opt {
-                    Some(rs) => EE::Quant(k, rs, rc, Box::new(re)),
+                    Some(rs) => EE::Quant(k, rs, rtrs, rc, Box::new(re)),
                     None => {
                         assert!(context.has_errors());
                         EE::UnresolvedError
@@ -1272,6 +1285,13 @@ fn exp_(context: &mut Context, sp!(loc, pe_): P::Exp) -> E::Exp {
             }
         }
         PE::Annotate(e, ty) => EE::Annotate(exp(context, *e), type_(context, ty)),
+        PE::Spec(_) if context.in_spec_context => {
+            context.error(vec![(
+                loc,
+                "'spec' blocks cannot be used inside of a spec context",
+            )]);
+            EE::UnresolvedError
+        }
         PE::Spec(spec_block) => {
             let (spec_id, unbound_names) = context.bind_exp_spec(spec_block);
             EE::Spec(spec_id, unbound_names)
@@ -1427,21 +1447,53 @@ fn assign(context: &mut Context, sp!(loc, e_): P::Exp) -> Option<E::LValue> {
     use E::LValue_ as EL;
     use P::Exp_ as PE;
     let a_ = match e_ {
-        PE::Name(sp!(_, P::ModuleAccess_::ModuleAccess(..)), _)
-        | PE::Name(sp!(_, P::ModuleAccess_::QualifiedModuleAccess(..)), _)
-        | PE::Name(_, Some(_))
-            if !context.require_spec_context(
-                loc,
-                "only simple names allowed in assignment outside of specifications",
-            ) =>
+        PE::Name(n @ sp!(_, P::ModuleAccess_::ModuleAccess(_, _)), _)
+        | PE::Name(n @ sp!(_, P::ModuleAccess_::QualifiedModuleAccess(_, _)), _)
+            if !context.in_spec_context =>
         {
-            assert!(context.has_errors());
+            let msg = format!(
+                "Unexpected assignment of module access without fields outside of a spec \
+                 context.\nIf you are trying to unpack a struct, try adding fields, e.g. '{} {{}}'",
+                n
+            );
+            context.error(vec![(loc, msg)]);
+
+            // For unused alias warnings and unbound modules
+            module_access(context, Access::Term, n);
+
+            return None;
+        }
+        PE::Name(n, Some(_)) if !context.in_spec_context => {
+            let msg = format!(
+                "Unexpected assignment of instantiated type without fields outside of a spec \
+                 context.\nIf you are trying to unpack a struct, try adding fields, e.g. '{} {{}}'",
+                n
+            );
+            context.error(vec![(loc, msg)]);
+
+            // For unused alias warnings and unbound modules
+            module_access(context, Access::Term, n);
+
             return None;
         }
         PE::Name(pn, ptys_opt) => {
             let en = module_access(context, Access::Term, pn)?;
-            let tys_opt = optional_types(context, ptys_opt);
-            EL::Var(en, tys_opt)
+            match &en.value {
+                E::ModuleAccess_::ModuleAccess(m, n) if !context.in_spec_context => {
+                    let msg = format!(
+                        "Unexpected assignment of module access without fields outside of a spec \
+                         context.\nIf you are trying to unpack a struct, try adding fields, e.g. \
+                         '{}::{} {{}}'",
+                        m, n,
+                    );
+                    context.error(vec![(loc, msg)]);
+                    return None;
+                }
+                _ => {
+                    let tys_opt = optional_types(context, ptys_opt);
+                    EL::Var(en, tys_opt)
+                }
+            }
         }
         PE::Pack(pn, ptys_opt, pfields) => {
             let en = module_access(context, Access::ApplyNamed, pn)?;
@@ -1548,10 +1600,13 @@ fn unbound_names_exp(unbound: &mut BTreeSet<Name>, sp!(_, e_): &E::Exp) {
             // remove anything in `ls`
             unbound_names_binds(unbound, ls);
         }
-        EE::Quant(_, rs, cr_opt, er) => {
+        EE::Quant(_, rs, trs, cr_opt, er) => {
             unbound_names_exp(unbound, er);
             if let Some(cr) = cr_opt {
                 unbound_names_exp(unbound, cr);
+            }
+            for tr in trs {
+                unbound_names_exps(unbound, tr);
             }
             // remove anything in `rs`
             unbound_names_binds_with_range(unbound, rs);
@@ -1680,7 +1735,8 @@ fn check_valid_local_name(context: &mut Context, v: &Var) {
     }
     if !is_valid(v.value()) {
         let msg = format!(
-            "Invalid local name '{}'. Local names must start with 'a'..'z' (or '_')",
+            "Invalid local variable name '{}'. Local variable names must start with 'a'..'z' (or \
+             '_')",
             v,
         );
         context.error(vec![(v.loc(), msg)])

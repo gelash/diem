@@ -28,9 +28,9 @@ use bytes::Bytes;
 use channel::{self, diem_channel, message_queues::QueueStyle};
 use diem_config::network_id::NetworkContext;
 use diem_logger::prelude::*;
-use diem_network_address::NetworkAddress;
 use diem_rate_limiter::rate_limit::TokenBucketRateLimiter;
-use diem_types::PeerId;
+use diem_time_service::{TimeService, TimeServiceTrait};
+use diem_types::{network_address::NetworkAddress, PeerId};
 use futures::{
     channel::oneshot,
     future::{BoxFuture, FutureExt},
@@ -40,6 +40,7 @@ use futures::{
 };
 use netcore::transport::{ConnectionOrigin, Transport};
 use serde::Serialize;
+use short_hex_str::AsShortHexStr;
 use std::{
     collections::{hash_map::Entry, HashMap},
     fmt,
@@ -57,6 +58,8 @@ mod error;
 mod tests;
 
 pub use self::error::PeerManagerError;
+use diem_config::config::{PeerRole, PeerSet};
+use diem_infallible::RwLock;
 
 /// Request received by PeerManager from upstream actors.
 #[derive(Debug, Serialize)]
@@ -244,6 +247,8 @@ where
     network_context: Arc<NetworkContext>,
     /// A handle to a tokio executor.
     executor: Handle,
+    /// A handle to a time service for easily mocking time-related operations.
+    time_service: TimeService,
     /// Address to listen on for incoming connections.
     listen_addr: NetworkAddress,
     /// Connection Listener, listening on `listen_addr`
@@ -256,6 +261,8 @@ where
             diem_channel::Sender<ProtocolId, PeerRequest>,
         ),
     >,
+    /// Known trusted peers from discovery
+    trusted_peers: Arc<RwLock<PeerSet>>,
     /// Channel to receive requests from other actors.
     requests_rx: diem_channel::Receiver<(PeerId, ProtocolId), PeerManagerRequest>,
     /// Upstream handlers for RPC and DirectSend protocols. The handlers are promised fair delivery
@@ -300,9 +307,11 @@ where
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         executor: Handle,
+        time_service: TimeService,
         transport: TTransport,
         network_context: Arc<NetworkContext>,
         listen_addr: NetworkAddress,
+        trusted_peers: Arc<RwLock<PeerSet>>,
         requests_rx: diem_channel::Receiver<(PeerId, ProtocolId), PeerManagerRequest>,
         connection_reqs_rx: diem_channel::Receiver<PeerId, ConnectionRequest>,
         upstream_handlers: HashMap<
@@ -329,6 +338,7 @@ where
         let _guard = executor.enter();
         let (transport_handler, listen_addr) = TransportHandler::new(
             network_context.clone(),
+            time_service.clone(),
             transport,
             listen_addr,
             transport_reqs_rx,
@@ -338,9 +348,11 @@ where
         Self {
             network_context,
             executor,
+            time_service,
             listen_addr,
             transport_handler: Some(transport_handler),
             active_peers: HashMap::new(),
+            trusted_peers,
             requests_rx,
             connection_reqs_rx,
             transport_reqs_tx,
@@ -367,10 +379,10 @@ where
             .filter(|(_, (metadata, _))| metadata.origin == ConnectionOrigin::Inbound)
             .count();
         let outbound = total.saturating_sub(inbound);
-        let role = self.network_context.role().as_str();
 
+        // TODO: Work with PEs to update this to be a `NetworkId` rather than `RoleType`
         counters::DIEM_NETWORK_PEERS
-            .with_label_values(&[role, "connected"])
+            .with_label_values(&[self.network_context.role().as_str(), "connected"])
             .set(total as i64);
 
         counters::connections(&self.network_context, ConnectionOrigin::Inbound).set(inbound as i64);
@@ -446,42 +458,75 @@ where
         );
         self.sample_connected_peers();
         match event {
-            TransportNotification::NewConnection(conn) => {
-                // TODO: Keep track of somewhere else to not take this hit in case of DDoS
-                let inbound_conns = self
-                    .active_peers
-                    .iter()
-                    .filter(|(_, (metadata, _))| metadata.origin == ConnectionOrigin::Inbound)
-                    .count();
+            TransportNotification::NewConnection(mut conn) => {
+                match conn.metadata.origin {
+                    ConnectionOrigin::Outbound => {
+                        // TODO: This is right now a hack around having to feed trusted peers deeper in the outbound path.  Inbound ones are assigned at Noise handshake time.
+                        conn.metadata.role = self
+                            .trusted_peers
+                            .read()
+                            .get(&conn.metadata.remote_peer_id)
+                            .map_or(PeerRole::Unknown, |auth_context| auth_context.role);
 
-                // Reject excessive inbound connections by letting them just drop out of scope
-                // We control outbound connections with Connectivity manager before we even send them
-                // and we must allow connections that already exist to pass through tie breaking.
-                // TODO: Allow for trusted peers to still connect
-                if conn.metadata.origin == ConnectionOrigin::Outbound
-                    || self
-                        .active_peers
-                        .contains_key(&conn.metadata.remote_peer_id)
-                    || inbound_conns < self.inbound_connection_limit
-                {
-                    info!(
-                        NetworkSchema::new(&self.network_context)
-                            .connection_metadata_with_address(&conn.metadata),
-                        "{} New connection established: {}", self.network_context, conn.metadata
-                    );
-                    // Add new peer, updating counters and all
-                    self.add_peer(conn);
-                    self.update_connected_peers_metrics();
-                } else {
-                    info!(
-                        NetworkSchema::new(&self.network_context)
-                            .connection_metadata_with_address(&conn.metadata),
-                        "{} Connection rejected due to connection limit: {}",
-                        self.network_context,
-                        conn.metadata
-                    );
-                    self.disconnect(conn);
+                        if conn.metadata.role == PeerRole::Unknown {
+                            warn!(
+                                NetworkSchema::new(&self.network_context)
+                                    .connection_metadata_with_address(&conn.metadata),
+                                "{} Outbound connection made with unknown peer role: {}",
+                                self.network_context,
+                                conn.metadata
+                            )
+                        }
+                    }
+                    ConnectionOrigin::Inbound => {
+                        // Everything below here is meant for unknown peers only, role comes from
+                        // Noise handshake and if it's not `Unknown` it is trusted
+                        if conn.metadata.role == PeerRole::Unknown {
+                            // TODO: Keep track of somewhere else to not take this hit in case of DDoS
+                            // Count unknown inbound connections
+                            let unknown_inbound_conns = self
+                                .active_peers
+                                .iter()
+                                .filter(|(peer_id, (metadata, _))| {
+                                    metadata.origin == ConnectionOrigin::Inbound
+                                        && self
+                                            .trusted_peers
+                                            .read()
+                                            .get(peer_id)
+                                            .map_or(true, |peer| peer.role == PeerRole::Unknown)
+                                })
+                                .count();
+
+                            // Reject excessive inbound connections made by unknown peers
+                            // We control outbound connections with Connectivity manager before we even send them
+                            // and we must allow connections that already exist to pass through tie breaking.
+                            if !self
+                                .active_peers
+                                .contains_key(&conn.metadata.remote_peer_id)
+                                && unknown_inbound_conns > self.inbound_connection_limit
+                            {
+                                info!(
+                                    NetworkSchema::new(&self.network_context)
+                                        .connection_metadata_with_address(&conn.metadata),
+                                    "{} Connection rejected due to connection limit: {}",
+                                    self.network_context,
+                                    conn.metadata
+                                );
+                                self.disconnect(conn);
+                                return;
+                            }
+                        }
+                    }
                 }
+
+                // Add new peer, updating counters and all
+                info!(
+                    NetworkSchema::new(&self.network_context)
+                        .connection_metadata_with_address(&conn.metadata),
+                    "{} New connection established: {}", self.network_context, conn.metadata
+                );
+                self.add_peer(conn);
+                self.update_connected_peers_metrics();
             }
             TransportNotification::Disconnected(lost_conn_metadata, reason) => {
                 // See: https://github.com/diem/diem/issues/3128#issuecomment-605351504 for
@@ -711,13 +756,15 @@ where
 
     fn disconnect(&mut self, connection: Connection<TSocket>) {
         let network_context = self.network_context.clone();
+        let time_service = self.time_service.clone();
 
         // Close connection, and drop it
         let drop_fut = async move {
             let mut connection = connection;
             let peer_id = connection.metadata.remote_peer_id;
-            if let Err(e) =
-                tokio::time::timeout(transport::TRANSPORT_TIMEOUT, connection.socket.close()).await
+            if let Err(e) = time_service
+                .timeout(transport::TRANSPORT_TIMEOUT, connection.socket.close())
+                .await
             {
                 error!(
                     NetworkSchema::new(&network_context)
@@ -797,6 +844,7 @@ where
         let peer = Peer::new(
             self.network_context.clone(),
             self.executor.clone(),
+            self.time_service.clone(),
             connection,
             self.transport_notifs_tx.clone(),
             peer_reqs_rx,
@@ -949,6 +997,7 @@ where
     TSocket: AsyncRead + AsyncWrite,
 {
     network_context: Arc<NetworkContext>,
+    time_service: TimeService,
     /// [`Transport`] that is used to establish connections
     transport: TTransport,
     listener: Fuse<TTransport::Listener>,
@@ -966,6 +1015,7 @@ where
 {
     fn new(
         network_context: Arc<NetworkContext>,
+        time_service: TimeService,
         transport: TTransport,
         listen_addr: NetworkAddress,
         transport_reqs_rx: channel::Receiver<TransportRequest>,
@@ -984,6 +1034,7 @@ where
         (
             Self {
                 network_context,
+                time_service,
                 transport,
                 listener: listener.fuse(),
                 transport_reqs_rx,
@@ -1026,7 +1077,7 @@ where
                             )
                             .inc();
 
-                            let start_time = Instant::now();
+                            let start_time = self.time_service.now();
                             pending_inbound_connections.push(upgrade.map(move |out| (out, addr, start_time)));
                         }
                         Err(e) => {
@@ -1081,7 +1132,7 @@ where
                         )
                         .inc();
 
-                        let start_time = Instant::now();
+                        let start_time = self.time_service.now();
                         Some(
                             upgrade
                                 .map(move |out| (out, addr, peer_id, start_time, response_tx))
@@ -1118,7 +1169,7 @@ where
         counters::pending_connection_upgrades(&self.network_context, ConnectionOrigin::Outbound)
             .dec();
 
-        let elapsed_time = start_time.elapsed().as_secs_f64();
+        let elapsed_time = (self.time_service.now() - start_time).as_secs_f64();
         let upgrade = match upgrade {
             Ok(connection) => {
                 let dialed_peer_id = connection.metadata.remote_peer_id;
@@ -1205,7 +1256,7 @@ where
         counters::pending_connection_upgrades(&self.network_context, ConnectionOrigin::Inbound)
             .dec();
 
-        let elapsed_time = start_time.elapsed().as_secs_f64();
+        let elapsed_time = (self.time_service.now() - start_time).as_secs_f64();
         match upgrade {
             Ok(connection) => {
                 debug!(

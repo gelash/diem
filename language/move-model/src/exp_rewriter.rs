@@ -4,7 +4,7 @@
 use std::collections::{BTreeSet, VecDeque};
 
 use crate::{
-    ast::Exp,
+    ast::{Exp, LocalVarDecl, TempIndex},
     model::{GlobalEnv, NodeId},
     symbol::Symbol,
     ty::Type,
@@ -15,16 +15,25 @@ use itertools::Itertools;
 /// types.
 pub struct ExpRewriter<'env, 'rewriter> {
     env: &'env GlobalEnv,
-    replacer: &'rewriter mut dyn FnMut(NodeId, Symbol) -> Option<Exp>,
+    replacer: &'rewriter mut dyn FnMut(NodeId, RewriteTarget) -> Option<Exp>,
     type_args: &'rewriter [Type],
     shadowed: VecDeque<BTreeSet<Symbol>>,
+}
+
+/// A target for expression rewrites of either an `Exp::LocalVar` or an `Exp::Temporary`.
+/// This is used as a parameter to the `replacer` function which defines the behavior of
+/// the rewriter. Notice we use a single function entry point for `replacer` to allow it
+/// to be a function which mutates it's context.
+pub enum RewriteTarget {
+    LocalVar(Symbol),
+    Temporary(TempIndex),
 }
 
 impl<'env, 'rewriter> ExpRewriter<'env, 'rewriter> {
     /// Creates a new rewriter with the given replacer map.
     pub fn new<F>(env: &'env GlobalEnv, replacer: &'rewriter mut F) -> Self
     where
-        F: FnMut(NodeId, Symbol) -> Option<Exp>,
+        F: FnMut(NodeId, RewriteTarget) -> Option<Exp>,
     {
         ExpRewriter {
             env,
@@ -46,6 +55,7 @@ impl<'env, 'rewriter> ExpRewriter<'env, 'rewriter> {
         use crate::ast::Exp::*;
         match exp {
             LocalVar(id, sym) => self.replace_local(*id, *sym),
+            Temporary(id, idx) => self.replace_temporary(*id, *idx),
             Call(id, oper, args) => Call(
                 self.rewrite_attrs(*id),
                 oper.clone(),
@@ -57,27 +67,25 @@ impl<'env, 'rewriter> ExpRewriter<'env, 'rewriter> {
                 self.rewrite_vec(args),
             ),
             Lambda(id, vars, body) => {
+                let vars = self.rewrite_decls(vars);
                 self.shadowed
                     .push_front(vars.iter().map(|decl| decl.name).collect());
-                let res = Lambda(
-                    self.rewrite_attrs(*id),
-                    vars.clone(),
-                    Box::new(self.rewrite(body)),
-                );
+                let res = Lambda(self.rewrite_attrs(*id), vars, Box::new(self.rewrite(body)));
                 self.shadowed.pop_front();
                 res
             }
-            Quant(id, kind, ranges, condition, body) => {
-                let ranges = ranges
-                    .iter()
-                    .map(|(decl, range)| (decl.clone(), self.rewrite(range)))
-                    .collect_vec();
+            Quant(id, kind, ranges, triggers, condition, body) => {
+                let ranges = self.rewrite_quant_decls(ranges);
                 self.shadowed
                     .push_front(ranges.iter().map(|(decl, _)| decl.name).collect());
                 let res = Quant(
                     self.rewrite_attrs(*id),
                     *kind,
                     ranges,
+                    triggers
+                        .iter()
+                        .map(|trigger| trigger.iter().map(|exp| self.rewrite(&*exp)).collect())
+                        .collect(),
                     condition.as_ref().map(|exp| Box::new(self.rewrite(&*exp))),
                     Box::new(self.rewrite(body)),
                 );
@@ -85,13 +93,10 @@ impl<'env, 'rewriter> ExpRewriter<'env, 'rewriter> {
                 res
             }
             Block(id, vars, body) => {
+                let vars = self.rewrite_decls(vars);
                 self.shadowed
                     .push_front(vars.iter().map(|decl| decl.name).collect());
-                let res = Block(
-                    self.rewrite_attrs(*id),
-                    vars.clone(),
-                    Box::new(self.rewrite(body)),
-                );
+                let res = Block(self.rewrite_attrs(*id), vars, Box::new(self.rewrite(body)));
                 self.shadowed.pop_front();
                 res
             }
@@ -105,6 +110,33 @@ impl<'env, 'rewriter> ExpRewriter<'env, 'rewriter> {
         }
     }
 
+    fn rewrite_decls(&mut self, decls: &[LocalVarDecl]) -> Vec<LocalVarDecl> {
+        decls
+            .iter()
+            .map(|d| LocalVarDecl {
+                id: self.rewrite_attrs(d.id),
+                name: d.name,
+                binding: d.binding.as_ref().map(|e| self.rewrite(e)),
+            })
+            .collect()
+    }
+
+    fn rewrite_quant_decls(&mut self, decls: &[(LocalVarDecl, Exp)]) -> Vec<(LocalVarDecl, Exp)> {
+        decls
+            .iter()
+            .map(|(d, e)| {
+                (
+                    LocalVarDecl {
+                        id: self.rewrite_attrs(d.id),
+                        name: d.name,
+                        binding: d.binding.as_ref().map(|e| self.rewrite(e)),
+                    },
+                    self.rewrite(e),
+                )
+            })
+            .collect()
+    }
+
     fn replace_local(&mut self, node_id: NodeId, sym: Symbol) -> Exp {
         for vars in &self.shadowed {
             if vars.contains(&sym) {
@@ -112,7 +144,7 @@ impl<'env, 'rewriter> ExpRewriter<'env, 'rewriter> {
                 return Exp::LocalVar(node_id, sym);
             }
         }
-        if let Some(exp) = (*self.replacer)(node_id, sym) {
+        if let Some(exp) = (*self.replacer)(node_id, RewriteTarget::LocalVar(sym)) {
             exp
         } else {
             let node_id = self.rewrite_attrs(node_id);
@@ -120,9 +152,16 @@ impl<'env, 'rewriter> ExpRewriter<'env, 'rewriter> {
         }
     }
 
+    fn replace_temporary(&mut self, node_id: NodeId, idx: TempIndex) -> Exp {
+        if let Some(exp) = (*self.replacer)(node_id, RewriteTarget::Temporary(idx)) {
+            exp
+        } else {
+            let node_id = self.rewrite_attrs(node_id);
+            Exp::Temporary(node_id, idx)
+        }
+    }
+
     pub fn rewrite_vec(&mut self, exps: &[Exp]) -> Vec<Exp> {
-        // For some reason, we don't get the lifetime right when we use a map. Figure out
-        // why and remove this explicit treatment.
         let mut res = vec![];
         for exp in exps {
             res.push(self.rewrite(exp));

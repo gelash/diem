@@ -34,6 +34,7 @@ use channel::diem_channel;
 use diem_config::network_id::NetworkContext;
 use diem_logger::prelude::*;
 use diem_rate_limiter::rate_limit::SharedBucket;
+use diem_time_service::{TimeService, TimeServiceTrait};
 use diem_types::PeerId;
 use futures::{
     self,
@@ -43,6 +44,7 @@ use futures::{
     FutureExt, SinkExt, TryFutureExt,
 };
 use serde::Serialize;
+use short_hex_str::AsShortHexStr;
 use std::{fmt, panic, sync::Arc, time::Duration};
 use tokio::runtime::Handle;
 use tokio_util::compat::{
@@ -107,6 +109,8 @@ pub struct Peer<TSocket> {
     network_context: Arc<NetworkContext>,
     /// A handle to a tokio executor.
     executor: Handle,
+    /// A handle to a time service for easily mocking time-related operations.
+    time_service: TimeService,
     /// Connection specific information.
     connection_metadata: ConnectionMetadata,
     /// Underlying connection.
@@ -139,6 +143,7 @@ where
     pub fn new(
         network_context: Arc<NetworkContext>,
         executor: Handle,
+        time_service: TimeService,
         connection: Connection<TSocket>,
         connection_notifs_tx: channel::Sender<TransportNotification<TSocket>>,
         peer_reqs_rx: diem_channel::Receiver<ProtocolId, PeerRequest>,
@@ -158,6 +163,7 @@ where
         Self {
             network_context: network_context.clone(),
             executor,
+            time_service: time_service.clone(),
             connection_metadata,
             connection: Some(socket),
             connection_notifs_tx,
@@ -165,12 +171,14 @@ where
             peer_notifs_tx,
             inbound_rpcs: InboundRpcs::new(
                 network_context.clone(),
+                time_service.clone(),
                 remote_peer_id,
                 inbound_rpc_timeout,
                 max_concurrent_inbound_rpcs,
             ),
             outbound_rpcs: OutboundRpcs::new(
                 network_context,
+                time_service,
                 remote_peer_id,
                 max_concurrent_outbound_rpcs,
             ),
@@ -217,6 +225,7 @@ where
         //   2. `close_tx`: Handle to close the task and underlying connection.
         let (mut write_reqs_tx, writer_close_tx) = Self::start_writer_task(
             &self.executor,
+            self.time_service.clone(),
             self.connection_metadata.clone(),
             self.network_context.clone(),
             writer,
@@ -292,6 +301,7 @@ where
     // them and immediately closes the connection.
     fn start_writer_task(
         executor: &Handle,
+        time_service: TimeService,
         connection_metadata: ConnectionMetadata,
         network_context: Arc<NetworkContext>,
         mut writer: NetworkMessageSink<impl AsyncWrite + Unpin + Send + 'static>,
@@ -349,7 +359,10 @@ where
                 writer.close().await?;
                 Ok(()) as Result<(), WriteError>
             };
-            match tokio::time::timeout(transport::TRANSPORT_TIMEOUT, flush_and_close).await {
+            match time_service
+                .timeout(transport::TRANSPORT_TIMEOUT, flush_and_close)
+                .await
+            {
                 Err(_) => {
                     info!(
                         NetworkSchema::new(&network_context)
@@ -497,8 +510,8 @@ where
         }
     }
 
-    async fn handle_outbound_request<'a>(
-        &'a mut self,
+    async fn handle_outbound_request(
+        &mut self,
         request: PeerRequest,
         write_reqs_tx: &mut channel::Sender<(
             NetworkMessage,

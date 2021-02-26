@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    context::{Context, MaterializedPools, TABLE_MAX_SIZE},
+    context::{CompiledDependency, Context, MaterializedPools, TABLE_MAX_SIZE},
     errors::*,
 };
 use anyhow::{bail, format_err, Result};
@@ -22,13 +22,13 @@ use std::{
     },
 };
 use vm::{
-    access::ModuleAccess,
     errors::Location as VMErrorLocation,
     file_format::{
-        Bytecode, CodeOffset, CodeUnit, CompiledModule, CompiledModuleMut, CompiledScript,
-        CompiledScriptMut, Constant, FieldDefinition, FunctionDefinition, FunctionSignature, Kind,
-        Signature, SignatureToken, StructDefinition, StructDefinitionIndex, StructFieldInformation,
-        StructHandleIndex, TableIndex, TypeParameterIndex, TypeSignature,
+        Ability, AbilitySet, Bytecode, CodeOffset, CodeUnit, CompiledModule, CompiledModuleMut,
+        CompiledScript, CompiledScriptMut, Constant, FieldDefinition, FunctionDefinition,
+        FunctionSignature, Signature, SignatureToken, StructDefinition, StructDefinitionIndex,
+        StructFieldInformation, StructHandleIndex, TableIndex, TypeParameterIndex, TypeSignature,
+        Visibility,
     },
 };
 
@@ -361,12 +361,11 @@ impl FunctionFrame {
         Ok(cur_loc_idx)
     }
 
-    fn push_loop(&mut self, start_loc: usize) -> Result<()> {
+    fn push_loop(&mut self, start_loc: usize) {
         self.loops.push(LoopInfo {
             start_loc,
             breaks: Vec::new(),
         });
-        Ok(())
     }
 
     fn pop_loop(&mut self) -> Result<()> {
@@ -406,18 +405,25 @@ impl FunctionFrame {
 }
 
 /// Compile a transaction script.
-pub fn compile_script<'a, T: 'a + ModuleAccess>(
+pub fn compile_script<'a>(
     address: Option<AccountAddress>,
     script: Script,
-    dependencies: impl IntoIterator<Item = &'a T>,
+    dependencies: impl IntoIterator<Item = &'a CompiledModule>,
 ) -> Result<(CompiledScript, SourceMap<Loc>)> {
-    let mut context = Context::new(dependencies, None)?;
+    let mut context = Context::new(HashMap::new(), None)?;
+    for dep in dependencies {
+        context.add_compiled_dependency(dep)?;
+    }
 
-    compile_imports(&mut context, address, script.imports)?;
+    compile_imports(&mut context, address, script.imports.clone())?;
+    // Add explicit handles/dependency declarations to `dependencies`
     compile_explicit_dependency_declarations(
         &mut context,
+        None,
+        script.imports,
         script.explicit_dependency_declarations,
     )?;
+
     for ir_constant in script.constants {
         let constant = compile_constant(&mut context, ir_constant.signature, ir_constant.value)?;
         context.declare_constant(ir_constant.name.clone(), constant.clone())?;
@@ -449,6 +455,7 @@ pub fn compile_script<'a, T: 'a + ModuleAccess>(
             function_instantiations,
             ..
         },
+        _compiled_deps,
         source_map,
     ) = context.materialize_pools();
     let compiled_script = CompiledScriptMut {
@@ -474,20 +481,30 @@ pub fn compile_script<'a, T: 'a + ModuleAccess>(
 }
 
 /// Compile a module.
-pub fn compile_module<'a, T: 'a + ModuleAccess>(
+pub fn compile_module<'a>(
     address: AccountAddress,
     module: ModuleDefinition,
-    dependencies: impl IntoIterator<Item = &'a T>,
+    dependencies: impl IntoIterator<Item = &'a CompiledModule>,
 ) -> Result<(CompiledModule, SourceMap<Loc>)> {
     let current_module = QualifiedModuleIdent {
         address,
         name: module.name,
     };
-    let mut context = Context::new(dependencies, Some(current_module.clone()))?;
+    let mut context = Context::new(HashMap::new(), Some(current_module.clone()))?;
+    for dep in dependencies {
+        context.add_compiled_dependency(dep)?;
+    }
     let self_name = ModuleName::new(ModuleName::self_name().into());
     let self_module_handle_idx = context.declare_import(current_module, self_name.clone())?;
     // Explicitly declare all imports as they will be included even if not used
-    compile_imports(&mut context, Some(address), module.imports)?;
+    compile_imports(&mut context, Some(address), module.imports.clone())?;
+    // Add explicit handles/dependency declarations to `dependencies`
+    compile_explicit_dependency_declarations(
+        &mut context,
+        Some(address),
+        module.imports,
+        module.explicit_dependency_declarations,
+    )?;
 
     // Explicitly declare all structs as they will be included even if not used
     for s in &module.structs {
@@ -495,15 +512,9 @@ pub fn compile_module<'a, T: 'a + ModuleAccess>(
             module: self_name.clone(),
             name: s.value.name.clone(),
         };
-        let kinds = type_parameter_kinds(&s.value.type_formals);
+        let kinds = type_parameter_kinds(&s.value.type_formals, true);
         context.declare_struct_handle_index(ident, s.value.is_nominal_resource, kinds)?;
     }
-
-    // Add explicit handles/dependency declarations to the pools
-    compile_explicit_dependency_declarations(
-        &mut context,
-        module.explicit_dependency_declarations,
-    )?;
 
     for ir_constant in module.constants {
         let constant = compile_constant(&mut context, ir_constant.signature, ir_constant.value)?;
@@ -536,6 +547,7 @@ pub fn compile_module<'a, T: 'a + ModuleAccess>(
             struct_def_instantiations,
             field_instantiations,
         },
+        _compiled_deps,
         source_map,
     ) = context.materialize_pools();
     let compiled_module = CompiledModuleMut {
@@ -553,6 +565,8 @@ pub fn compile_module<'a, T: 'a + ModuleAccess>(
         constant_pool,
         struct_defs,
         function_defs,
+        // TODO (mengxu): add friend declarations when the IR compiler is ready
+        friend_decls: vec![],
     };
     compiled_module
         .freeze()
@@ -562,16 +576,26 @@ pub fn compile_module<'a, T: 'a + ModuleAccess>(
         .map(|frozen_module| (frozen_module, source_map))
 }
 
+// Note: DO NOT try to recover from this function as it zeros out the `outer_contexts` dependencies
+// and sets them after a successful result
+// Any `Error` should stop compilation in the caller
 fn compile_explicit_dependency_declarations(
-    context: &mut Context,
+    outer_context: &mut Context,
+    address_opt: Option<AccountAddress>,
+    imports: Vec<ImportDefinition>,
     dependencies: Vec<ModuleDependency>,
 ) -> Result<()> {
+    let mut dependencies_acc = outer_context.take_dependencies();
     for dependency in dependencies {
         let ModuleDependency {
             name: mname,
             structs,
             functions,
         } = dependency;
+        let current_module = outer_context.module_ident(&mname)?;
+        let mut context = Context::new(dependencies_acc, Some(current_module.clone()))?;
+        compile_imports(&mut context, address_opt, imports.clone())?;
+        let self_module_handle_idx = context.module_handle_index(&mname)?;
         for struct_dep in structs {
             let StructDependency {
                 is_nominal_resource,
@@ -579,15 +603,61 @@ fn compile_explicit_dependency_declarations(
                 type_formals: tys,
             } = struct_dep;
             let sname = QualifiedStructIdent::new(mname.clone(), name);
-            let kinds = type_parameter_kinds(&tys);
+            let kinds = type_parameter_kinds(&tys, true);
             context.declare_struct_handle_index(sname, is_nominal_resource, kinds)?;
         }
         for function_dep in functions {
             let FunctionDependency { name, signature } = function_dep;
-            let sig = function_signature(context, &signature)?;
+            let sig = function_signature(&mut context, &signature)?;
             context.declare_function(mname.clone(), name, sig)?;
         }
+
+        let (
+            MaterializedPools {
+                module_handles,
+                struct_handles,
+                function_handles,
+                field_handles,
+                signatures,
+                identifiers,
+                address_identifiers,
+                constant_pool,
+                function_instantiations,
+                struct_def_instantiations,
+                field_instantiations,
+            },
+            compiled_deps,
+            _source_map,
+        ) = context.materialize_pools();
+        let compiled_module = CompiledModuleMut {
+            module_handles,
+            self_module_handle_idx,
+            struct_handles,
+            function_handles,
+            field_handles,
+            struct_def_instantiations,
+            function_instantiations,
+            field_instantiations,
+            signatures,
+            identifiers,
+            address_identifiers,
+            constant_pool,
+            struct_defs: vec![],
+            function_defs: vec![],
+            // TODO (mengxu): add friend declarations when the IR compiler is ready
+            friend_decls: vec![],
+        }
+        .freeze()
+        .map_err(|e| {
+            InternalCompilerError::BoundsCheckErrors(e.finish(VMErrorLocation::Undefined))
+        })?;
+        dependencies_acc = compiled_deps;
+        dependencies_acc.insert(
+            current_module.clone(),
+            CompiledDependency::stored(compiled_module)?,
+        );
     }
+    outer_context.restore_dependencies(dependencies_acc);
     Ok(())
 }
 
@@ -641,15 +711,26 @@ fn make_type_argument_subst(
     Ok(subst)
 }
 
-fn type_parameter_kinds(ast_tys: &[(TypeVar, ast::Kind)]) -> Vec<Kind> {
-    ast_tys.iter().map(|(_, k)| kind(k)).collect()
+fn type_parameter_kinds(
+    ast_tys: &[(TypeVar, ast::Kind)],
+    struct_type_parameters: bool,
+) -> Vec<AbilitySet> {
+    ast_tys
+        .iter()
+        .map(|(_, k)| kind(k, struct_type_parameters))
+        .collect()
 }
 
-fn kind(ast_k: &ast::Kind) -> Kind {
-    match ast_k {
-        ast::Kind::All => Kind::All,
-        ast::Kind::Resource => Kind::Resource,
-        ast::Kind::Copyable => Kind::Copyable,
+fn kind(ast_k: &ast::Kind, struct_type_parameters: bool) -> AbilitySet {
+    let set = match ast_k {
+        ast::Kind::All => AbilitySet::EMPTY,
+        ast::Kind::Resource => AbilitySet::EMPTY | Ability::Key,
+        ast::Kind::Copyable => AbilitySet::EMPTY | Ability::Copy | Ability::Drop,
+    };
+    if !struct_type_parameters {
+        set | Ability::Store
+    } else {
+        set
     }
 }
 
@@ -719,7 +800,7 @@ fn function_signature(
         .iter()
         .map(|(_, ty)| compile_type(context, &m, ty))
         .collect::<Result<_>>()?;
-    let type_parameters = f.type_formals.iter().map(|(_, k)| kind(k)).collect();
+    let type_parameters = f.type_formals.iter().map(|(_, k)| kind(k, false)).collect();
     Ok(vm::file_format::FunctionSignature {
         return_,
         parameters,
@@ -843,9 +924,10 @@ fn compile_function(
 
     let ast_function = ast_function.value;
 
-    let is_public = match ast_function.visibility {
-        FunctionVisibility::Internal => false,
-        FunctionVisibility::Public => true,
+    let visibility = match ast_function.visibility {
+        FunctionVisibility::Public => Visibility::Public,
+        FunctionVisibility::Script => Visibility::Script,
+        FunctionVisibility::Internal => Visibility::Private,
     };
     let acquires_global_resources = ast_function
         .acquires
@@ -857,7 +939,7 @@ fn compile_function(
 
     Ok(FunctionDefinition {
         function: fh_idx,
-        is_public,
+        visibility,
         acquires_global_resources,
         code,
     })
@@ -977,7 +1059,7 @@ fn compile_while(
     make_push_instr!(context, code);
     let cond_span = while_.cond.loc;
     let loop_start_loc = code.len();
-    function_frame.push_loop(loop_start_loc)?;
+    function_frame.push_loop(loop_start_loc);
     compile_expression(context, function_frame, code, while_.cond)?;
 
     let brfalse_loc = code.len();
@@ -1019,7 +1101,7 @@ fn compile_loop(
 ) -> Result<ControlFlowInfo> {
     make_push_instr!(context, code);
     let loop_start_loc = code.len();
-    function_frame.push_loop(loop_start_loc)?;
+    function_frame.push_loop(loop_start_loc);
 
     let body_cf_info = compile_block(context, function_frame, code, loop_.block.value)?;
     push_instr!(loop_.block.loc, Bytecode::Branch(loop_start_loc as u16));

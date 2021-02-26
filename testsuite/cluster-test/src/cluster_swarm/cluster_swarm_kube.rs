@@ -138,7 +138,7 @@ impl ClusterSwarmKube {
         let config = Config::new(
             reqwest::Url::parse(HEALTH_CHECK_URL).expect("Failed to parse kubernetes endpoint url"),
         );
-        let client = Client::new(config);
+        let client = Client::try_from(config)?;
         let credentials_provider = WebIdentityProvider::from_k8s_env();
         let dispatcher =
             rusoto_core::HttpClient::new().expect("failed to create request dispatcher");
@@ -220,6 +220,7 @@ impl ClusterSwarmKube {
         let suffix = thread_rng()
             .sample_iter(&Alphanumeric)
             .take(10)
+            .map(char::from)
             .collect::<String>()
             .to_ascii_lowercase();
         let job_full_name = format!("{}-{}", job_name, suffix);
@@ -412,6 +413,7 @@ impl ClusterSwarmKube {
                 let suffix = thread_rng()
                     .sample_iter(&Alphanumeric)
                     .take(10)
+                    .map(char::from)
                     .collect::<String>()
                     .to_ascii_lowercase();
                 let job_name = format!("remove-network-effects-{}", suffix);

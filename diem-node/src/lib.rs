@@ -5,7 +5,7 @@ use backup_service::start_backup_service;
 use consensus::{consensus_provider::start_consensus, gen_consensus_reconfig_subscription};
 use debug_interface::node_debug_service::NodeDebugService;
 use diem_config::{
-    config::{NetworkConfig, NodeConfig, RoleType},
+    config::{NetworkConfig, NodeConfig},
     network_id::NodeNetworkId,
     utils::get_genesis_txn,
 };
@@ -13,6 +13,7 @@ use diem_json_rpc::bootstrap_from_config as bootstrap_rpc;
 use diem_logger::{prelude::*, Logger};
 use diem_mempool::gen_mempool_reconfig_subscription;
 use diem_metrics::metric_server;
+use diem_time_service::TimeService;
 use diem_types::{
     account_config::diem_root_address, account_state::AccountState, chain_id::ChainId,
     move_resource::MoveStorage, PeerId,
@@ -315,22 +316,22 @@ pub fn setup_environment(node_config: &NodeConfig, logger: Option<Arc<Logger>>) 
     }
 
     // Gather all network configs into a single vector.
-    // TODO:  consider explicitly encoding the role in the NetworkConfig
-    let mut network_configs: Vec<(RoleType, &NetworkConfig)> = node_config
-        .full_node_networks
-        .iter()
-        .map(|network_config| (RoleType::FullNode, network_config))
-        .collect();
+    let mut network_configs: Vec<&NetworkConfig> = node_config.full_node_networks.iter().collect();
     if let Some(network_config) = node_config.validator_network.as_ref() {
-        network_configs.push((RoleType::Validator, network_config));
+        network_configs.push(network_config);
     }
 
     let mut network_builders = Vec::new();
 
     // Instantiate every network and collect the requisite endpoints for state_sync, mempool, and consensus.
-    for (idx, (role, network_config)) in network_configs.into_iter().enumerate() {
+    for (idx, network_config) in network_configs.into_iter().enumerate() {
         // Perform common instantiation steps
-        let mut network_builder = NetworkBuilder::create(chain_id, role, network_config);
+        let mut network_builder = NetworkBuilder::create(
+            chain_id,
+            node_config.base.role,
+            network_config,
+            TimeService::real(),
+        );
         let network_id = network_config.network_id.clone();
 
         // Create the endpoints to connect the Network to State Sync.
@@ -347,27 +348,23 @@ pub fn setup_environment(node_config: &NodeConfig, logger: Option<Arc<Logger>>) 
             diem_mempool::network::network_endpoint_config(MEMPOOL_NETWORK_CHANNEL_BUFFER_SIZE),
         );
         mempool_network_handles.push((
-            NodeNetworkId::new(network_id, idx),
+            NodeNetworkId::new(network_id.clone(), idx),
             mempool_sender,
             mempool_events,
         ));
 
-        match role {
-            // Perform steps relevant specifically to Validator networks.
-            RoleType::Validator => {
-                // A valid config is allowed to have at most one ValidatorNetwork
-                // TODO:  `expect_none` would be perfect here, once it is stable.
-                if consensus_network_handles.is_some() {
-                    panic!("There can be at most one validator network!");
-                }
-
-                consensus_network_handles =
-                    Some(network_builder.add_protocol_handler(
-                        consensus::network_interface::network_endpoint_config(),
-                    ));
+        // Perform steps relevant specifically to Validator networks.
+        if network_id.is_validator_network() {
+            // A valid config is allowed to have at most one ValidatorNetwork
+            // TODO:  `expect_none` would be perfect here, once it is stable.
+            if consensus_network_handles.is_some() {
+                panic!("There can be at most one validator network!");
             }
-            // Currently no FullNode network specific steps.
-            RoleType::FullNode => (),
+
+            consensus_network_handles = Some(
+                network_builder
+                    .add_protocol_handler(consensus::network_interface::network_endpoint_config()),
+            );
         }
 
         reconfig_subscriptions.append(network_builder.reconfig_subscriptions());
@@ -380,11 +377,7 @@ pub fn setup_environment(node_config: &NodeConfig, logger: Option<Arc<Logger>>) 
         let network_context = network_builder.network_context();
         debug!("Creating runtime for {}", network_context);
         let runtime = Builder::new_multi_thread()
-            .thread_name(format!(
-                "network-{}-{}",
-                network_context.role(),
-                network_context.network_id()
-            ))
+            .thread_name(format!("network-{}", network_context.network_id()))
             .enable_all()
             .build()
             .expect("Failed to start runtime. Won't be able to start networking.");
@@ -413,7 +406,7 @@ pub fn setup_environment(node_config: &NodeConfig, logger: Option<Arc<Logger>>) 
         state_sync_to_mempool_sender,
         Arc::clone(&db_rw.reader),
         chunk_executor,
-        &node_config,
+        node_config,
         genesis_waypoint,
         reconfig_subscriptions,
     );
@@ -440,7 +433,8 @@ pub fn setup_environment(node_config: &NodeConfig, logger: Option<Arc<Logger>>) 
     // network provider -> consensus -> state synchronizer -> network provider.  This has resulted
     // in a deadlock as observed in GitHub issue #749.
     if let Some((consensus_network_sender, consensus_network_events)) = consensus_network_handles {
-        let state_sync_client = state_sync_bootstrapper.create_client();
+        let state_sync_client =
+            state_sync_bootstrapper.create_client(node_config.state_sync.client_commit_timeout_ms);
 
         // Make sure that state synchronizer is caught up at least to its waypoint
         // (in case it's present). There is no sense to start consensus prior to that.

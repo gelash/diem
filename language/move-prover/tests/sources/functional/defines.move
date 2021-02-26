@@ -1,5 +1,5 @@
-// flag: --v2
 module TestDefines {
+
     spec module {
         pragma verify = true;
     }
@@ -44,5 +44,19 @@ module TestDefines {
     spec fun equal_R {
         aborts_if !exists_both(addr1, addr2);
         ensures result == (get(addr1) == get(addr2));
+    }
+
+    // ------------------------------------------
+    // Spec functions derived from Move functions
+    // ------------------------------------------
+
+    fun add_as_spec_fun(x: u64, y: u64): u64 { x + y }
+    fun add_fun(x: u64, y: u64): u64 { x + y }
+    spec fun add_fun {
+        include AddOk;
+    }
+    spec schema AddOk {
+        x: num; y: num; result: num;
+        ensures result == add_as_spec_fun(x, y);
     }
 }

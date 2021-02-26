@@ -8,11 +8,14 @@ use crate::{
     function_target::{FunctionData, FunctionTarget},
     function_target_pipeline::{FunctionTargetProcessor, FunctionTargetsHolder},
     livevar_analysis::LiveVarAnnotation,
-    stackless_bytecode::{AssignKind, BorrowNode, Bytecode, Operation, TempIndex},
+    stackless_bytecode::{AssignKind, BorrowNode, Bytecode, Operation},
     stackless_control_flow_graph::StacklessControlFlowGraph,
 };
 use itertools::Itertools;
-use move_model::model::{FunctionEnv, QualifiedId};
+use move_model::{
+    ast::TempIndex,
+    model::{FunctionEnv, QualifiedId},
+};
 use std::collections::{BTreeMap, BTreeSet};
 use vm::file_format::CodeOffset;
 
@@ -363,7 +366,7 @@ impl<'a> TransferFunctions for BorrowAnalysis<'a> {
                     }
                 }
             }
-            Call(_, dests, oper, srcs) => {
+            Call(_, dests, oper, srcs, _) => {
                 use Operation::*;
                 match oper {
                     // In the borrows below, we only create an edge if the
@@ -505,9 +508,9 @@ impl TransferFunctions for PropagateSplicedAnalysis {
                 .extend(borrow.after.spliced_nodes.iter().cloned());
         }
         match instr {
-            Call(_, dests, BorrowLoc, _)
-            | Call(_, dests, BorrowGlobal(..), _)
-            | Call(_, dests, BorrowField(..), _) => {
+            Call(_, dests, BorrowLoc, ..)
+            | Call(_, dests, BorrowGlobal(..), ..)
+            | Call(_, dests, BorrowField(..), ..) => {
                 state.spliced.remove(&BorrowNode::Reference(dests[0]));
             }
             _ => {}
@@ -523,7 +526,7 @@ impl PropagateSplicedAnalysis {
     }
 
     fn run(self, instrs: &[Bytecode]) -> BTreeMap<CodeOffset, BorrowInfoAtCodeOffset> {
-        let cfg = StacklessControlFlowGraph::new_backward(instrs);
+        let cfg = StacklessControlFlowGraph::new_backward(instrs, false);
         let state_map = self.analyze_function(SplicedState::default(), instrs, &cfg);
         let mut data = self.state_per_instruction(state_map, instrs, &cfg, |before, after| {
             (before.clone(), after.clone())

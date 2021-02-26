@@ -4,8 +4,8 @@
 use crate::{
     access::ModuleAccess,
     file_format::{
-        CompiledModule, FieldDefinition, FunctionHandle, Kind, SignatureToken, StructDefinition,
-        StructFieldInformation, TypeParameterIndex,
+        AbilitySet, CompiledModule, FieldDefinition, FunctionHandle, SignatureToken,
+        StructDefinition, StructFieldInformation, TypeParameterIndex, Visibility,
     },
 };
 use move_core_types::{
@@ -59,8 +59,8 @@ pub struct Field {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Struct {
     pub name: Identifier,
-    pub kind: Kind,
-    pub type_parameters: Vec<Kind>,
+    pub abilities: AbilitySet,
+    pub type_parameters: Vec<AbilitySet>,
     pub fields: Vec<Field>,
 }
 
@@ -69,7 +69,7 @@ pub struct Struct {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FunctionSignature {
     pub name: Identifier,
-    pub type_parameters: Vec<Kind>,
+    pub type_parameters: Vec<AbilitySet>,
     pub formals: Vec<Type>,
     pub ret: Vec<Type>,
 }
@@ -81,7 +81,7 @@ pub struct Module {
     pub address: AccountAddress,
     pub name: Identifier,
     pub structs: Vec<Struct>,
-    pub public_functions: Vec<FunctionSignature>,
+    pub externally_visible_functions: Vec<(Visibility, FunctionSignature)>,
 }
 
 impl Module {
@@ -90,22 +90,22 @@ impl Module {
     /// normalized representation of a module that won't verify (since it can't be published).
     pub fn new(m: &CompiledModule) -> Self {
         let structs = m.struct_defs().iter().map(|d| Struct::new(m, d)).collect();
-        let public_functions = m
+        let externally_visible_functions = m
             .function_defs()
             .iter()
-            .filter_map(|f| {
-                if f.is_public {
-                    Some(FunctionSignature::new(m, m.function_handle_at(f.function)))
-                } else {
-                    None
-                }
+            .filter_map(|f| match f.visibility {
+                v @ Visibility::Public | v @ Visibility::Script | v @ Visibility::Friend => Some((
+                    v,
+                    FunctionSignature::new(m, m.function_handle_at(f.function)),
+                )),
+                Visibility::Private => None,
             })
             .collect();
         Self {
             address: *m.address(),
             name: m.name().to_owned(),
             structs,
-            public_functions,
+            externally_visible_functions,
         }
     }
 }
@@ -229,11 +229,7 @@ impl Struct {
         };
         Struct {
             name: m.identifier_at(handle.name).to_owned(),
-            kind: if handle.is_nominal_resource {
-                Kind::Resource
-            } else {
-                Kind::Copyable
-            },
+            abilities: handle.abilities,
             type_parameters: handle.type_parameters.clone(),
             fields,
         }

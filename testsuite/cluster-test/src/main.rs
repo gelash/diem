@@ -312,7 +312,7 @@ async fn emit_tx(cluster: &Cluster, args: &Args) -> Result<()> {
         wait_committed: !args.burst,
     };
     let duration = Duration::from_secs(args.duration);
-    let mut emitter = TxEmitter::new(cluster, args.vasp, args.invalid_tx);
+    let mut emitter = TxEmitter::new(cluster, args.vasp);
     let stats = emitter
         .emit_txn_for_with_stats(
             duration,
@@ -322,6 +322,7 @@ async fn emit_tx(cluster: &Cluster, args: &Args) -> Result<()> {
                 workers_per_ac,
                 thread_params,
                 gas_price: 0,
+                invalid_tx: args.invalid_tx,
             },
             10,
         )
@@ -370,7 +371,7 @@ impl BasicSwarmUtil {
     }
 
     pub async fn diag(&self, vasp: bool) -> Result<()> {
-        let emitter = TxEmitter::new(&self.cluster, vasp, 0);
+        let emitter = TxEmitter::new(&self.cluster, vasp);
         let mut faucet_account: Option<AccountData> = None;
         let instances: Vec<_> = self.cluster.validator_and_fullnode_instances().collect();
         for instance in &instances {
@@ -474,6 +475,7 @@ impl ClusterTestRunner {
 
     /// Discovers cluster, setup log, etc
     pub async fn setup(args: &Args) -> Result<Self> {
+        let start_time = Instant::now();
         let current_tag = args.deploy.as_deref().unwrap_or("master");
         let cluster_swarm = ClusterSwarmKube::new()
             .await
@@ -502,9 +504,11 @@ impl ClusterTestRunner {
         let slack_changelog_url = env::var("SLACK_CHANGELOG_URL")
             .map(|u| u.parse().expect("Failed to parse SLACK_CHANGELOG_URL"))
             .ok();
-        let tx_emitter = TxEmitter::new(&cluster, args.vasp, args.invalid_tx);
+        let tx_emitter = TxEmitter::new(&cluster, args.vasp);
         let github = GitHub::new();
-        let report = SuiteReport::new();
+        let mut report = SuiteReport::new();
+        let end_time = (Instant::now() - start_time).as_secs() as u64;
+        report.report_text(format!("Test runner setup time spent {} secs", end_time));
         let global_emit_job_request = EmitJobRequest {
             instances: vec![],
             accounts_per_client: args.accounts_per_client,
@@ -514,6 +518,7 @@ impl ClusterTestRunner {
                 wait_committed: !args.burst,
             },
             gas_price: 0,
+            invalid_tx: args.invalid_tx,
         };
         let emit_to_validator =
             if cluster.fullnode_instances().len() < cluster.validator_instances().len() {
@@ -588,16 +593,20 @@ impl ClusterTestRunner {
         info!("Starting suite");
         let suite_started = Instant::now();
         for experiment in suite.experiments {
+            let start_time = Instant::now();
             let experiment_name = format!("{}", experiment);
             let experiment_result = self
                 .run_single_experiment(experiment, None)
                 .await
                 .map_err(move |e| format_err!("Experiment `{}` failed: `{}`", experiment_name, e));
+            let end_time = (Instant::now() - start_time).as_secs() as u64;
             if let Err(e) = experiment_result.as_ref() {
                 self.report.report_text(e.to_string());
                 self.print_report();
                 experiment_result?;
             }
+            self.report
+                .report_text_same_line(format!(", time spent {} secs", end_time))
         }
         info!(
             "Suite completed in {:?}",

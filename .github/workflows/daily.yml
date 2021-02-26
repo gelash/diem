@@ -17,7 +17,7 @@ jobs:
       matrix:
         #this is a painful solution since it doesn't pick up new branches, other option is lotsa shell in one job....
         #to test in canary add in canary here.....
-        target-branch: [master, release-1.1, canary]
+        target-branch: [master, release-1.1]
     env:
       MESSAGE_PAYLOAD_FILE: /tmp/message
     steps:
@@ -28,8 +28,10 @@ jobs:
       - name: install cargo-audit
         run: cargo install --force cargo-audit
       - name: audit crates
+        # List of ignored RUSTSEC
+        # 1. RUSTSEC-2021-0020 - Not impacted, see #7723
         run: |
-          $CARGO $CARGOFLAGS audit >> $MESSAGE_PAYLOAD_FILE
+          $CARGO $CARGOFLAGS audit --ignore RUSTSEC-2021-0020 >> $MESSAGE_PAYLOAD_FILE
       - uses: ./.github/actions/slack-file
         with:
           webhook: ${{ secrets.WEBHOOK_AUDIT }}

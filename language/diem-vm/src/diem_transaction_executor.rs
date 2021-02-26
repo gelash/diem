@@ -6,14 +6,14 @@ use crate::{
     data_cache::StateViewCache,
     diem_transaction_validator::validate_signature_checked_transaction,
     diem_vm::{
-        charge_global_write_gas_usage, get_transaction_output,
-        txn_effects_to_writeset_and_events_cached, DiemVMImpl, DiemVMInternals,
+        charge_global_write_gas_usage, convert_changeset_and_events, get_transaction_output,
+        DiemVMImpl, DiemVMInternals,
     },
     errors::expect_only_successful_execution,
     logging::AdapterLogSchema,
     system_module_names::*,
     transaction_metadata::TransactionMetadata,
-    txn_effects_to_writeset_and_events, VMExecutor,
+    VMExecutor,
 };
 use diem_logger::prelude::*;
 use diem_state_view::StateView;
@@ -22,8 +22,8 @@ use diem_types::{
     account_config,
     block_metadata::BlockMetadata,
     transaction::{
-        ChangeSet, Module, Script, SignatureCheckedTransaction, Transaction, TransactionArgument,
-        TransactionOutput, TransactionPayload, TransactionStatus, WriteSetPayload,
+        ChangeSet, Module, Script, SignatureCheckedTransaction, Transaction, TransactionOutput,
+        TransactionPayload, TransactionStatus, WriteSetPayload,
     },
     vm_status::{KeptVMStatus, StatusCode, VMStatus},
     write_set::{WriteSet, WriteSetMut},
@@ -33,12 +33,11 @@ use move_core_types::{
     account_address::AccountAddress,
     gas_schedule::{CostTable, GasAlgebra, GasCarrier, GasUnits},
     identifier::IdentStr,
+    transaction_argument::convert_txn_args,
+    value::{serialize_values, MoveValue},
 };
 use move_vm_runtime::{data_cache::RemoteCache, logging::LogContext, session::Session};
-use move_vm_types::{
-    gas_schedule::{zero_cost_schedule, CostStrategy},
-    values::Value,
-};
+use move_vm_types::gas_schedule::{zero_cost_schedule, CostStrategy};
 use rayon::prelude::*;
 use std::{
     collections::HashSet,
@@ -247,7 +246,7 @@ impl DiemVM {
     }
 
     fn execute_user_transaction(
-        &mut self,
+        &self,
         remote_cache: &StateViewCache<'_>,
         txn: &SignatureCheckedTransaction,
         log_context: &impl LogContext,
@@ -360,9 +359,9 @@ impl DiemVM {
                     .and_then(|_| tmp_session.finish())
                     .map_err(|e| e.into_vm_status());
                 match execution_result {
-                    Ok(effect) => {
+                    Ok((changeset, events)) => {
                         let (cs, events) =
-                            txn_effects_to_writeset_and_events(effect).map_err(Err)?;
+                            convert_changeset_and_events(changeset, events).map_err(Err)?;
                         ChangeSet::new(cs, events)
                     }
                     Err(e) => {
@@ -389,8 +388,8 @@ impl DiemVM {
     }
 
     fn process_waypoint_change_set(
-        &mut self,
-        remote_cache: &mut StateViewCache<'_>,
+        &self,
+        remote_cache: &StateViewCache<'_>,
         writeset_payload: WriteSetPayload,
         log_context: &impl LogContext,
     ) -> Result<(VMStatus, TransactionOutput), VMStatus> {
@@ -409,8 +408,8 @@ impl DiemVM {
     }
 
     fn process_block_prologue(
-        &mut self,
-        remote_cache: &mut StateViewCache<'_>,
+        &self,
+        remote_cache: &StateViewCache<'_>,
         block_metadata: BlockMetadata,
         log_context: &impl LogContext,
     ) -> Result<(VMStatus, TransactionOutput), VMStatus> {
@@ -420,31 +419,32 @@ impl DiemVM {
             ))
         });
 
-        let mut txn_data = TransactionMetadata::default();
-        txn_data.sender = account_config::reserved_vm_address();
-
+        let txn_data = TransactionMetadata {
+            sender: account_config::reserved_vm_address(),
+            ..Default::default()
+        };
         let gas_schedule = zero_cost_schedule();
         let mut cost_strategy = CostStrategy::system(&gas_schedule, GasUnits::new(0));
         let mut session = self.0.new_session(remote_cache);
 
         let (round, timestamp, previous_vote, proposer) = block_metadata.into_inner();
-        let args = vec![
-            Value::transaction_argument_signer_reference(txn_data.sender),
-            Value::u64(round),
-            Value::u64(timestamp),
-            Value::vector_address(previous_vote),
-            Value::address(proposer),
-        ];
+        let args = serialize_values(&vec![
+            MoveValue::Signer(txn_data.sender),
+            MoveValue::U64(round),
+            MoveValue::U64(timestamp),
+            MoveValue::Vector(previous_vote.into_iter().map(MoveValue::Address).collect()),
+            MoveValue::Address(proposer),
+        ]);
         session
             .execute_function(
                 &DIEM_BLOCK_MODULE,
                 &BLOCK_PROLOGUE,
                 vec![],
                 args,
-                txn_data.sender,
                 &mut cost_strategy,
                 log_context,
             )
+            .map(|_return_vals| ())
             .or_else(|e| {
                 expect_only_successful_execution(e, BLOCK_PROLOGUE.as_str(), log_context)
             })?;
@@ -461,7 +461,7 @@ impl DiemVM {
     }
 
     fn process_writeset_transaction(
-        &mut self,
+        &self,
         remote_cache: &StateViewCache<'_>,
         txn: SignatureCheckedTransaction,
         log_context: &impl LogContext,
@@ -497,7 +497,7 @@ impl DiemVM {
     }
 
     pub fn execute_writeset_transaction(
-        &mut self,
+        &self,
         remote_cache: &StateViewCache<'_>,
         writeset_payload: &WriteSetPayload,
         txn_data: TransactionMetadata,
@@ -527,9 +527,8 @@ impl DiemVM {
             return Ok((e, discard_error_output(StatusCode::INVALID_WRITE_SET)));
         };
 
-        let effects = session.finish().map_err(|e| e.into_vm_status())?;
-        let (epilogue_writeset, epilogue_events) =
-            txn_effects_to_writeset_and_events_cached(&mut (), effects)?;
+        let (changeset, events) = session.finish().map_err(|e| e.into_vm_status())?;
+        let (epilogue_writeset, epilogue_events) = convert_changeset_and_events(changeset, events)?;
 
         // Make sure epilogue WriteSet doesn't intersect with the writeset in TransactionPayload.
         if !epilogue_writeset
@@ -591,8 +590,8 @@ impl DiemVM {
         ))
     }
 
-    fn execute_block_impl(
-        &mut self,
+    pub(crate) fn execute_block_impl(
+        &self,
         transactions: Vec<Transaction>,
         data_cache: &mut StateViewCache,
     ) -> Result<Vec<(VMStatus, TransactionOutput)>, VMStatus> {
@@ -608,7 +607,7 @@ impl DiemVM {
             transactions.len()
         );
 
-        let signature_verified_block: Vec<Result<PreprocessedTransaction, VMStatus>>;
+        let signature_verified_block: Vec<PreprocessedTransaction>;
         {
             // Verify the signatures of all the transactions in parallel.
             // This is time consuming so don't wait and do the checking
@@ -632,50 +631,13 @@ impl DiemVM {
                 debug!(log_context, "Retry after reconfiguration");
                 continue;
             };
-            let (vm_status, output, sender) = match txn {
-                Ok(PreprocessedTransaction::BlockPrologue(block_metadata)) => {
-                    execute_block_trace_guard.clear();
-                    current_block_id = block_metadata.id();
-                    trace_code_block!("diem_vm::execute_block_impl", {"block", current_block_id}, execute_block_trace_guard);
-                    let (vm_status, output) =
-                        self.process_block_prologue(data_cache, block_metadata, &log_context)?;
-                    (vm_status, output, Some("block_prologue".to_string()))
-                }
-                Ok(PreprocessedTransaction::WaypointWriteSet(write_set_payload)) => {
-                    let (vm_status, output) = self.process_waypoint_change_set(
-                        data_cache,
-                        write_set_payload,
-                        &log_context,
-                    )?;
-                    (vm_status, output, Some("waypoint_write_set".to_string()))
-                }
-                Ok(PreprocessedTransaction::UserTransaction(txn)) => {
-                    let sender = txn.sender().to_string();
-                    let _timer = TXN_TOTAL_SECONDS.start_timer();
-                    let (vm_status, output) =
-                        self.execute_user_transaction(data_cache, &txn, &log_context);
-
-                    // Increment the counter for user transactions executed.
-                    let counter_label = match output.status() {
-                        TransactionStatus::Keep(_) => Some("success"),
-                        TransactionStatus::Discard(_) => Some("discarded"),
-                        TransactionStatus::Retry => None,
-                    };
-                    if let Some(label) = counter_label {
-                        USER_TRANSACTIONS_EXECUTED.with_label_values(&[label]).inc();
-                    }
-                    (vm_status, output, Some(sender))
-                }
-                Ok(PreprocessedTransaction::WriteSet(txn)) => {
-                    let (vm_status, output) =
-                        self.process_writeset_transaction(data_cache, *txn, &log_context)?;
-                    (vm_status, output, Some("write_set".to_string()))
-                }
-                Err(e) => {
-                    let (vm_status, output) = discard_error_vm_status(e);
-                    (vm_status, output, None)
-                }
+            if let PreprocessedTransaction::BlockMetadata(block_metadata) = &txn {
+                execute_block_trace_guard.clear();
+                current_block_id = block_metadata.id();
+                trace_code_block!("diem_vm::execute_block_impl", {"block", current_block_id}, execute_block_trace_guard);
             };
+            let (vm_status, output, sender) =
+                self.execute_single_transaction(txn, data_cache, &log_context)?;
             if !output.status().is_discarded() {
                 data_cache.push_write_set(output.write_set());
             } else {
@@ -710,6 +672,52 @@ impl DiemVM {
         Ok(result)
     }
 
+    pub(crate) fn execute_single_transaction(
+        &self,
+        txn: PreprocessedTransaction,
+        data_cache: &StateViewCache<'_>,
+        log_context: &impl LogContext,
+    ) -> Result<(VMStatus, TransactionOutput, Option<String>), VMStatus> {
+        Ok(match txn {
+            PreprocessedTransaction::BlockMetadata(block_metadata) => {
+                let (vm_status, output) =
+                    self.process_block_prologue(data_cache, block_metadata, log_context)?;
+                (vm_status, output, Some("block_prologue".to_string()))
+            }
+            PreprocessedTransaction::WaypointWriteSet(write_set_payload) => {
+                let (vm_status, output) =
+                    self.process_waypoint_change_set(data_cache, write_set_payload, log_context)?;
+                (vm_status, output, Some("waypoint_write_set".to_string()))
+            }
+            PreprocessedTransaction::UserTransaction(txn) => {
+                let sender = txn.sender().to_string();
+                let _timer = TXN_TOTAL_SECONDS.start_timer();
+                let (vm_status, output) =
+                    self.execute_user_transaction(data_cache, &txn, log_context);
+
+                // Increment the counter for user transactions executed.
+                let counter_label = match output.status() {
+                    TransactionStatus::Keep(_) => Some("success"),
+                    TransactionStatus::Discard(_) => Some("discarded"),
+                    TransactionStatus::Retry => None,
+                };
+                if let Some(label) = counter_label {
+                    USER_TRANSACTIONS_EXECUTED.with_label_values(&[label]).inc();
+                }
+                (vm_status, output, Some(sender))
+            }
+            PreprocessedTransaction::WriteSet(txn) => {
+                let (vm_status, output) =
+                    self.process_writeset_transaction(data_cache, *txn, log_context)?;
+                (vm_status, output, Some("write_set".to_string()))
+            }
+            PreprocessedTransaction::InvalidSignature => {
+                let (vm_status, output) =
+                    discard_error_vm_status(VMStatus::Error(StatusCode::INVALID_SIGNATURE));
+                (vm_status, output, None)
+            }
+        })
+    }
     /// Alternate form of 'execute_block' that keeps the vm_status before it goes into the
     /// `TransactionOutput`
     pub fn execute_block_and_keep_vm_status(
@@ -717,7 +725,7 @@ impl DiemVM {
         state_view: &dyn StateView,
     ) -> Result<Vec<(VMStatus, TransactionOutput)>, VMStatus> {
         let mut state_view_cache = StateViewCache::new(state_view);
-        let mut vm = DiemVM::new(&state_view_cache);
+        let vm = DiemVM::new(&state_view_cache);
         vm.execute_block_impl(transactions, &mut state_view_cache)
     }
 }
@@ -726,21 +734,23 @@ impl DiemVM {
 /// is a PreprocessedTransaction, where a user transaction is translated to a
 /// SignatureCheckedTransaction and also categorized into either a UserTransaction
 /// or a WriteSet transaction.
-fn preprocess_transaction(txn: Transaction) -> Result<PreprocessedTransaction, VMStatus> {
-    Ok(match txn {
-        Transaction::BlockMetadata(b) => PreprocessedTransaction::BlockPrologue(b),
+pub(crate) fn preprocess_transaction(txn: Transaction) -> PreprocessedTransaction {
+    match txn {
+        Transaction::BlockMetadata(b) => PreprocessedTransaction::BlockMetadata(b),
         Transaction::GenesisTransaction(ws) => PreprocessedTransaction::WaypointWriteSet(ws),
         Transaction::UserTransaction(txn) => {
-            let checked_txn = txn
-                .check_signature()
-                .map_err(|_| VMStatus::Error(StatusCode::INVALID_SIGNATURE))?;
+            let checked_txn = if let Ok(checked_txn) = txn.check_signature() {
+                checked_txn
+            } else {
+                return PreprocessedTransaction::InvalidSignature;
+            };
             if let TransactionPayload::WriteSet(_) = checked_txn.payload() {
                 PreprocessedTransaction::WriteSet(Box::new(checked_txn))
             } else {
                 PreprocessedTransaction::UserTransaction(Box::new(checked_txn))
             }
         }
-    })
+    }
 }
 
 fn is_reconfiguration(vm_output: &TransactionOutput) -> bool {
@@ -755,11 +765,12 @@ fn is_reconfiguration(vm_output: &TransactionOutput) -> bool {
 /// Waypoints and BlockPrologues are not signed and are unaffected by signature checking,
 /// but a user transaction or writeset transaction is transformed to a SignatureCheckedTransaction.
 #[derive(Debug)]
-enum PreprocessedTransaction {
+pub(crate) enum PreprocessedTransaction {
     UserTransaction(Box<SignatureCheckedTransaction>),
     WaypointWriteSet(WriteSetPayload),
-    BlockPrologue(BlockMetadata),
+    BlockMetadata(BlockMetadata),
     WriteSet(Box<SignatureCheckedTransaction>),
+    InvalidSignature,
 }
 
 // Executor external API
@@ -807,20 +818,6 @@ pub(crate) fn discard_error_output(err: StatusCode) -> TransactionOutput {
         0,
         TransactionStatus::Discard(err),
     )
-}
-
-/// Convert the transaction arguments into Move values.
-fn convert_txn_args(args: &[TransactionArgument]) -> Vec<Value> {
-    args.iter()
-        .map(|arg| match arg {
-            TransactionArgument::U8(i) => Value::u8(*i),
-            TransactionArgument::U64(i) => Value::u64(*i),
-            TransactionArgument::U128(i) => Value::u128(*i),
-            TransactionArgument::Address(a) => Value::address(*a),
-            TransactionArgument::Bool(b) => Value::bool(*b),
-            TransactionArgument::U8Vector(v) => Value::vector_u8(v.clone()),
-        })
-        .collect()
 }
 
 impl AsRef<DiemVMImpl> for DiemVM {

@@ -51,13 +51,18 @@ jobs:
         run: |
           BRANCH="$CHANGES_TARGET_BRANCH"
           success=0
-          docker/build_push.sh -u -p -b ${BRANCH} -n client || success=-1
-          docker/build_push.sh -u -p -b ${BRANCH} -n init || success=-1
-          docker/build_push.sh -u -p -b ${BRANCH} -n faucet || success=-1
-          docker/build_push.sh -u -p -b ${BRANCH} -n tools || success=-1
-          docker/build_push.sh -u -p -b ${BRANCH} -n validator || success=-1
-          docker/build_push.sh -u -p -b ${BRANCH} -n validator-tcb || success=-1
-          docker/build_push.sh -u -p -b ${BRANCH} -n cluster-test || success=-1
+          tmpfile=$(mktemp)
+          echo "Failed to push:" > "${tmpfile}"
+          docker/build_push.sh -u -p -b ${BRANCH} -n client || success=$(echo "client" >> "${tmpfile}"; echo 1)
+          docker/build_push.sh -u -p -b ${BRANCH} -n init || success=$(echo "init" >> "${tmpfile}"; echo 1)
+          docker/build_push.sh -u -p -b ${BRANCH} -n faucet || success=$(echo "faucet" >> "${tmpfile}"; echo 1)
+          docker/build_push.sh -u -p -b ${BRANCH} -n tools || success=$(echo "tools" >> "${tmpfile}"; echo 1)
+          docker/build_push.sh -u -p -b ${BRANCH} -n validator || success=$(echo "validator" >> "${tmpfile}"; echo 1)
+          docker/build_push.sh -u -p -b ${BRANCH} -n validator-tcb || success=$(echo "validator-tcb" >> "${tmpfile}"; echo 1)
+          docker/build_push.sh -u -p -b ${BRANCH} -n cluster-test || success=$(echo "cluster-test" >> "${tmpfile}"; echo 1)
+          if [[ "$success" == "1" ]]; then
+            cat "${tmpfile}"
+          fi
           exit $success
         env:
           DOCKER_CONTENT_TRUST_REPOSITORY_PASSPHRASE: ${{ secrets.DOCKERHUB_KEY_PASSWORD }}
@@ -67,14 +72,27 @@ jobs:
           set -x
           BRANCH=$(echo "$GITHUB_REF" | sed 's|.*/||' )
           success=0
-          docker/build_push.sh -u -b ${BRANCH} -n client || success=-1
-          docker/build_push.sh -u -b ${BRANCH} -n init || success=-1
-          docker/build_push.sh -u -b ${BRANCH} -n faucet || success=-1
-          docker/build_push.sh -u -b ${BRANCH} -n tools || success=-1
-          docker/build_push.sh -u -b ${BRANCH} -n validator || success=-1
-          docker/build_push.sh -u -b ${BRANCH} -n validator-tcb || success=-1
-          docker/build_push.sh -u -b ${BRANCH} -n cluster-test || success=-1
+          tmpfile=$(mktemp)
+          echo "Failed to push:" >> "${tmpfile}"
+          docker/build_push.sh -u -b ${BRANCH} -n client || success=$(echo "client" >> "${tmpfile}"; echo 1)
+          docker/build_push.sh -u -b ${BRANCH} -n init ||  success=$(echo "init" >> "${tmpfile}"; echo 1)
+          docker/build_push.sh -u -b ${BRANCH} -n faucet ||  success=$(echo "faucet" >> "${tmpfile}"; echo 1)
+          docker/build_push.sh -u -b ${BRANCH} -n tools ||  success=$(echo "tools" >> "${tmpfile}"; echo 1)
+          docker/build_push.sh -u -b ${BRANCH} -n validator || success=$(echo "validator" >> "${tmpfile}"; echo 1)
+          docker/build_push.sh -u -b ${BRANCH} -n validator-tcb || success=$(echo "validator-tcb" >> "${tmpfile}"; echo 1)
+          docker/build_push.sh -u -b ${BRANCH} -n cluster-test || success=$(echo "cluster-test" >> "${tmpfile}"; echo 1)
+          if [[ "$success" == "1" ]]; then
+            cat "${tmpfile}"
+          fi
           exit $success
+        env:
+          DOCKER_CONTENT_TRUST_REPOSITORY_PASSPHRASE: ${{ secrets.DOCKERHUB_KEY_PASSWORD }}
+      - name: Republish to libra.
+        if: ${{ always() && github.ref != 'refs/heads/auto' }}
+        run: |
+          GIT_REV=$(git rev-parse --short=8 HEAD)
+          BRANCH=$(echo "$GITHUB_REF" | sed 's|.*/||' )
+          docker/docker_republish.sh -t ${BRANCH}_${GIT_REV} -g libra
         env:
           DOCKER_CONTENT_TRUST_REPOSITORY_PASSPHRASE: ${{ secrets.DOCKERHUB_KEY_PASSWORD }}
       - name: docker image pruning.
@@ -89,4 +107,4 @@ jobs:
           GIT_REV=$(git rev-parse --short=8 HEAD)
           aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | \
           docker login --username AWS --password-stdin "${AWS_ECR_ACCOUNT_URL}"
-          docker/dockerhub_to_novi_ecr.sh -t ${BRANCH}_${GIT_REV} -r ${AWS_ECR_ACCOUNT_URL}
+          docker/docker_republish.sh -t ${BRANCH}_${GIT_REV} -r ${AWS_ECR_ACCOUNT_URL} -d

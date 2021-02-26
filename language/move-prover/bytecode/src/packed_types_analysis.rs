@@ -6,7 +6,7 @@ use crate::{
     dataflow_analysis::{
         AbstractDomain, DataflowAnalysis, JoinResult, SetDomain, TransferFunctions,
     },
-    function_target::FunctionData,
+    function_target::{FunctionData, FunctionTarget},
     function_target_pipeline::{FunctionTargetProcessor, FunctionTargetsHolder, FunctionVariant},
     stackless_bytecode::{Bytecode, Operation},
 };
@@ -105,7 +105,7 @@ impl<'a> TransferFunctions for PackedTypesAnalysis<'a> {
         use Bytecode::*;
         use Operation::*;
 
-        if let Call(_, _, oper, _) = instr {
+        if let Call(_, _, oper, ..) = instr {
             match oper {
                 Pack(mid, sid, types) => {
                     let env = self.cache.global_env();
@@ -151,7 +151,11 @@ impl<'a> TransferFunctions for PackedTypesAnalysis<'a> {
 
 impl<'a> DataflowAnalysis for PackedTypesAnalysis<'a> {}
 impl<'a> CompositionalAnalysis<PackedTypesState> for PackedTypesAnalysis<'a> {
-    fn to_summary(&self, state: PackedTypesState) -> PackedTypesState {
+    fn to_summary(
+        &self,
+        state: PackedTypesState,
+        _fun_target: &FunctionTarget,
+    ) -> PackedTypesState {
         state
     }
 }

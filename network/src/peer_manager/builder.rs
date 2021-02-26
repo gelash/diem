@@ -15,29 +15,23 @@ use crate::{
 };
 use channel::{self, diem_channel, message_queues::QueueStyle};
 use diem_config::{
-    config::{RateLimitConfig, HANDSHAKE_VERSION},
+    config::{PeerSet, RateLimitConfig, HANDSHAKE_VERSION},
     network_id::NetworkContext,
 };
 use diem_crypto::x25519;
 use diem_infallible::RwLock;
 use diem_logger::prelude::*;
 use diem_metrics::IntCounterVec;
-use diem_network_address::NetworkAddress;
 use diem_rate_limiter::rate_limit::TokenBucketRateLimiter;
-use diem_types::{chain_id::ChainId, PeerId};
+use diem_time_service::TimeService;
+use diem_types::{chain_id::ChainId, network_address::NetworkAddress, PeerId};
 #[cfg(any(test, feature = "testing", feature = "fuzzing"))]
 use netcore::transport::memory::MemoryTransport;
 use netcore::transport::{
     tcp::{TcpSocket, TcpTransport},
     Transport,
 };
-use std::{
-    clone::Clone,
-    collections::{HashMap, HashSet},
-    fmt::Debug,
-    net::IpAddr,
-    sync::Arc,
-};
+use std::{clone::Clone, collections::HashMap, fmt::Debug, net::IpAddr, sync::Arc};
 use tokio::runtime::Handle;
 
 // TODO:  This is the wrong logical location for this code to exist.  Determine the better location.
@@ -59,7 +53,7 @@ struct TransportContext {
     direct_send_protocols: Vec<ProtocolId>,
     rpc_protocols: Vec<ProtocolId>,
     authentication_mode: AuthenticationMode,
-    trusted_peers: Arc<RwLock<HashMap<PeerId, HashSet<x25519::PublicKey>>>>,
+    trusted_peers: Arc<RwLock<PeerSet>>,
 }
 
 impl TransportContext {
@@ -68,7 +62,7 @@ impl TransportContext {
         direct_send_protocols: Vec<ProtocolId>,
         rpc_protocols: Vec<ProtocolId>,
         authentication_mode: AuthenticationMode,
-        trusted_peers: Arc<RwLock<HashMap<PeerId, HashSet<x25519::PublicKey>>>>,
+        trusted_peers: Arc<RwLock<PeerSet>>,
     ) -> Self {
         Self {
             chain_id,
@@ -107,6 +101,7 @@ struct PeerManagerContext {
     connection_reqs_tx: diem_channel::Sender<PeerId, ConnectionRequest>,
     connection_reqs_rx: diem_channel::Receiver<PeerId, ConnectionRequest>,
 
+    trusted_peers: Arc<RwLock<PeerSet>>,
     upstream_handlers:
         HashMap<ProtocolId, diem_channel::Sender<(PeerId, ProtocolId), PeerManagerNotification>>,
     connection_event_handlers: Vec<conn_notifs_channel::Sender>,
@@ -123,6 +118,7 @@ impl PeerManagerContext {
         connection_reqs_tx: diem_channel::Sender<PeerId, ConnectionRequest>,
         connection_reqs_rx: diem_channel::Receiver<PeerId, ConnectionRequest>,
 
+        trusted_peers: Arc<RwLock<PeerSet>>,
         upstream_handlers: HashMap<
             ProtocolId,
             diem_channel::Sender<(PeerId, ProtocolId), PeerManagerNotification>,
@@ -139,6 +135,7 @@ impl PeerManagerContext {
             connection_reqs_tx,
             connection_reqs_rx,
 
+            trusted_peers,
             upstream_handlers,
             connection_event_handlers,
 
@@ -178,6 +175,7 @@ enum State {
 
 pub struct PeerManagerBuilder {
     network_context: Arc<NetworkContext>,
+    time_service: TimeService,
     transport_context: Option<TransportContext>,
     peer_manager_context: Option<PeerManagerContext>,
     // TODO(philiphayes): better support multiple listening addrs
@@ -198,9 +196,10 @@ impl PeerManagerBuilder {
     pub fn create(
         chain_id: ChainId,
         network_context: Arc<NetworkContext>,
+        time_service: TimeService,
         // TODO(philiphayes): better support multiple listening addrs
         listen_address: NetworkAddress,
-        trusted_peers: Arc<RwLock<HashMap<PeerId, HashSet<x25519::PublicKey>>>>,
+        trusted_peers: Arc<RwLock<PeerSet>>,
         authentication_mode: AuthenticationMode,
         channel_size: usize,
         max_concurrent_network_reqs: usize,
@@ -222,18 +221,20 @@ impl PeerManagerBuilder {
 
         Self {
             network_context,
+            time_service,
             transport_context: Some(TransportContext::new(
                 chain_id,
                 Vec::new(),
                 Vec::new(),
                 authentication_mode,
-                trusted_peers,
+                trusted_peers.clone(),
             )),
             peer_manager_context: Some(PeerManagerContext::new(
                 pm_reqs_tx,
                 pm_reqs_rx,
                 connection_reqs_tx,
                 connection_reqs_rx,
+                trusted_peers,
                 HashMap::new(),
                 Vec::new(),
                 max_concurrent_network_reqs,
@@ -276,7 +277,7 @@ impl PeerManagerBuilder {
     pub fn build(&mut self, executor: &Handle) -> &mut Self {
         assert_eq!(self.state, State::CREATED);
         self.state = State::BUILT;
-        use diem_network_address::Protocol::*;
+        use diem_types::network_address::Protocol::*;
 
         let transport_context = self
             .transport_context
@@ -303,6 +304,7 @@ impl PeerManagerBuilder {
                     DiemNetTransport::new(
                         DIEM_TCP_TRANSPORT.clone(),
                         self.network_context.clone(),
+                        self.time_service.clone(),
                         key,
                         auth_mode,
                         HANDSHAKE_VERSION,
@@ -319,6 +321,7 @@ impl PeerManagerBuilder {
                     DiemNetTransport::new(
                         MemoryTransport,
                         self.network_context.clone(),
+                        self.time_service.clone(),
                         key,
                         auth_mode,
                         HANDSHAKE_VERSION,
@@ -366,11 +369,13 @@ impl PeerManagerBuilder {
         );
         let peer_mgr = PeerManager::new(
             executor.clone(),
+            self.time_service.clone(),
             transport,
             self.network_context.clone(),
             // TODO(philiphayes): peer manager should take `Vec<NetworkAddress>`
             // (which could be empty, like in client use case)
             self.listen_address.clone(),
+            pm_context.trusted_peers,
             pm_context.pm_reqs_rx,
             pm_context.connection_reqs_rx,
             pm_context.upstream_handlers,

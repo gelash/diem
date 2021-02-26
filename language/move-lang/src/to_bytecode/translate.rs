@@ -449,6 +449,7 @@ fn function(
 fn visibility(v: FunctionVisibility) -> IR::FunctionVisibility {
     match v {
         FunctionVisibility::Public(_) => IR::FunctionVisibility::Public,
+        FunctionVisibility::Script(_) => IR::FunctionVisibility::Script,
         FunctionVisibility::Internal => IR::FunctionVisibility::Internal,
     }
 }
@@ -702,7 +703,7 @@ fn command(context: &mut Context, code: &mut IR::BytecodeBlock, sp!(loc, cmd_): 
             exp_(context, code, ecode);
             code.push(sp(loc, B::Abort));
         }
-        C::Return(e) => {
+        C::Return { exp: e, .. } => {
             exp_(context, code, e);
             code.push(sp(loc, B::Ret));
         }
@@ -712,7 +713,7 @@ fn command(context: &mut Context, code: &mut IR::BytecodeBlock, sp!(loc, cmd_): 
                 code.push(sp(loc, B::Pop));
             }
         }
-        C::Jump(lbl) => code.push(sp(loc, B::Branch(label(lbl)))),
+        C::Jump { target, .. } => code.push(sp(loc, B::Branch(label(target)))),
         C::JumpIf {
             cond,
             if_true,
@@ -815,6 +816,7 @@ fn exp_(context: &mut Context, code: &mut IR::BytecodeBlock, e: H::Exp) {
             exp(context, code, mcall.arguments);
             module_call(
                 context,
+                loc,
                 code,
                 mcall.module,
                 mcall.name,
@@ -912,13 +914,13 @@ fn exp_(context: &mut Context, code: &mut IR::BytecodeBlock, e: H::Exp) {
 
 fn module_call(
     context: &mut Context,
+    loc: Loc,
     code: &mut IR::BytecodeBlock,
     mident: ModuleIdent,
     fname: FunctionName,
     tys: Vec<H::BaseType>,
 ) {
     use IR::Bytecode_ as B;
-    let loc = fname.loc();
     let (m, n) = context.qualified_function_name(&mident, fname);
     code.push(sp(loc, B::Call(m, n, base_types(context, tys))))
 }

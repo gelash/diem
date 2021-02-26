@@ -7,6 +7,8 @@
 #![allow(clippy::trivially_copy_pass_by_ref)]
 // Allow writing 1 * KiB or 1 * MiB
 #![allow(clippy::identity_op)]
+// Criterion API has changed, TODO: Remove parameterized groups, and bench()
+#![allow(deprecated)]
 
 //! Network Benchmarks
 //! ==================
@@ -43,8 +45,7 @@ use criterion::{
     PlotConfiguration, Throughput,
 };
 use diem_logger::prelude::*;
-use diem_network_address::NetworkAddress;
-use diem_types::PeerId;
+use diem_types::{network_address::NetworkAddress, PeerId};
 use futures::{
     executor::block_on,
     io::{AsyncRead, AsyncWrite},

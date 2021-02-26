@@ -1,7 +1,7 @@
 // Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{coordinator::SyncState, counters};
+use crate::{counters, shared_components::SyncState};
 use anyhow::{format_err, Result};
 use diem_mempool::CommitResponse;
 use diem_types::{
@@ -18,8 +18,8 @@ use tokio::time::timeout;
 /// A sync request for a specified target ledger info.
 pub struct SyncRequest {
     pub callback: oneshot::Sender<Result<()>>,
+    pub last_commit_timestamp: SystemTime,
     pub target: LedgerInfoWithSignatures,
-    pub last_progress_tst: SystemTime,
 }
 
 /// A commit notification to notify state sync of new commits.
@@ -40,14 +40,20 @@ pub enum CoordinatorMessage {
 /// A client used for communicating with a StateSyncCoordinator.
 pub struct StateSyncClient {
     coordinator_sender: mpsc::UnboundedSender<CoordinatorMessage>,
+
+    /// Timeout for the StateSyncClient to receive an ack when executing commit().
+    commit_timeout_ms: u64,
 }
 
 impl StateSyncClient {
-    /// Timeout for the StateSyncClient to receive an ack when executing commit().
-    const COMMIT_TIMEOUT_SECS: u64 = 5;
-
-    pub fn new(coordinator_sender: mpsc::UnboundedSender<CoordinatorMessage>) -> Self {
-        Self { coordinator_sender }
+    pub fn new(
+        coordinator_sender: mpsc::UnboundedSender<CoordinatorMessage>,
+        commit_timeout_ms: u64,
+    ) -> Self {
+        Self {
+            coordinator_sender,
+            commit_timeout_ms,
+        }
     }
 
     /// Sync node's state to target ledger info (LI).
@@ -58,7 +64,7 @@ impl StateSyncClient {
         let request = SyncRequest {
             callback: cb_sender,
             target,
-            last_progress_tst: SystemTime::now(),
+            last_commit_timestamp: SystemTime::now(),
         };
 
         async move {
@@ -77,6 +83,8 @@ impl StateSyncClient {
     ) -> impl Future<Output = Result<()>> {
         let mut sender = self.coordinator_sender.clone();
         let (cb_sender, cb_receiver) = oneshot::channel();
+
+        let commit_timeout_ms = self.commit_timeout_ms;
         let notification = CommitNotification {
             callback: cb_sender,
             committed_transactions: committed_txns,
@@ -90,12 +98,7 @@ impl StateSyncClient {
                 )))
                 .await?;
 
-            match timeout(
-                Duration::from_secs(StateSyncClient::COMMIT_TIMEOUT_SECS),
-                cb_receiver,
-            )
-            .await
-            {
+            match timeout(Duration::from_millis(commit_timeout_ms), cb_receiver).await {
                 Err(_) => {
                     counters::COMMIT_FLOW_FAIL
                         .with_label_values(&[counters::STATE_SYNC_LABEL])
@@ -104,17 +107,15 @@ impl StateSyncClient {
                         "[State Sync Client] Timeout: failed to receive commit() ack in time!"
                     ))
                 }
-                // TODO(joshlind): clean up the use of CommitResponse.. having a string.is_empty()
-                // to check the presence of an error isn't great :(
                 Ok(response) => {
-                    let CommitResponse { msg } = response??;
-                    if msg != "" {
+                    let response = response??; // Unwrap the futures result to get the body
+                    if response.success {
+                        Ok(())
+                    } else {
                         Err(format_err!(
                             "[State Sync Client] Failed: commit() returned an error: {:?}",
-                            msg
+                            response.error_message
                         ))
-                    } else {
-                        Ok(())
                     }
                 }
             }

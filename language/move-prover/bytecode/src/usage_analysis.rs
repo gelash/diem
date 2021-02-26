@@ -77,7 +77,7 @@ struct MemoryUsageAnalysis<'a> {
 
 impl<'a> DataflowAnalysis for MemoryUsageAnalysis<'a> {}
 impl<'a> CompositionalAnalysis<UsageState> for MemoryUsageAnalysis<'a> {
-    fn to_summary(&self, state: UsageState) -> UsageState {
+    fn to_summary(&self, state: UsageState, _fun_target: &FunctionTarget) -> UsageState {
         state
     }
 }
@@ -120,7 +120,7 @@ impl<'a> TransferFunctions for MemoryUsageAnalysis<'a> {
         use Bytecode::*;
         use Operation::*;
 
-        if let Call(_, _, oper, _) = code {
+        if let Call(_, _, oper, _, _) = code {
             match oper {
                 Function(mid, fid, _) => {
                     if let Some(summary) = self.cache.get::<UsageState>(mid.qualified(*fid)) {
@@ -133,7 +133,7 @@ impl<'a> TransferFunctions for MemoryUsageAnalysis<'a> {
                     state.directly_modified_memory.insert(mid.qualified(*sid));
                     state.used_memory.insert(mid.qualified(*sid));
                 }
-                Exists(mid, sid, _) | GetField(mid, sid, ..) | GetGlobal(mid, sid, _) => {
+                Exists(mid, sid, _) | GetGlobal(mid, sid, _) => {
                     state.used_memory.insert(mid.qualified(*sid));
                 }
                 _ => {}

@@ -6,30 +6,21 @@ use crate::{
     counters,
     peer_manager::{conn_notifs_channel, ConnectionRequestSender},
 };
-use diem_config::network_id::NetworkContext;
-use diem_crypto::x25519;
+use diem_config::{config::PeerSet, network_id::NetworkContext};
 use diem_infallible::RwLock;
-use diem_network_address::NetworkAddress;
-use diem_types::PeerId;
-use futures::stream::StreamExt;
-use futures_util::stream::Fuse;
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-    time::Duration,
-};
-use tokio::{runtime::Handle, time::interval};
+use diem_time_service::TimeService;
+use std::{sync::Arc, time::Duration};
+use tokio::runtime::Handle;
 use tokio_retry::strategy::ExponentialBackoff;
-use tokio_stream::wrappers::IntervalStream;
 
-pub type ConnectivityManagerService = ConnectivityManager<Fuse<IntervalStream>, ExponentialBackoff>;
+pub type ConnectivityManagerService = ConnectivityManager<ExponentialBackoff>;
 
 /// The configuration fields for ConnectivityManager
 struct ConnectivityManagerBuilderConfig {
     network_context: Arc<NetworkContext>,
-    eligible: Arc<RwLock<HashMap<PeerId, HashSet<x25519::PublicKey>>>>,
-    seed_addrs: HashMap<PeerId, Vec<NetworkAddress>>,
-    seed_pubkeys: HashMap<PeerId, HashSet<x25519::PublicKey>>,
+    time_service: TimeService,
+    eligible: Arc<RwLock<PeerSet>>,
+    seeds: PeerSet,
     connectivity_check_interval_ms: u64,
     backoff_base: u64,
     max_connection_delay_ms: u64,
@@ -56,9 +47,9 @@ pub struct ConnectivityManagerBuilder {
 impl ConnectivityManagerBuilder {
     pub fn create(
         network_context: Arc<NetworkContext>,
-        eligible: Arc<RwLock<HashMap<PeerId, HashSet<x25519::PublicKey>>>>,
-        seed_addrs: HashMap<PeerId, Vec<NetworkAddress>>,
-        seed_pubkeys: HashMap<PeerId, HashSet<x25519::PublicKey>>,
+        time_service: TimeService,
+        eligible: Arc<RwLock<PeerSet>>,
+        seeds: PeerSet,
         connectivity_check_interval_ms: u64,
         backoff_base: u64,
         max_connection_delay_ms: u64,
@@ -74,9 +65,9 @@ impl ConnectivityManagerBuilder {
         Self {
             config: Some(ConnectivityManagerBuilderConfig {
                 network_context,
+                time_service,
                 eligible,
-                seed_addrs,
-                seed_pubkeys,
+                seeds,
                 connectivity_check_interval_ms,
                 backoff_base,
                 max_connection_delay_ms,
@@ -107,18 +98,15 @@ impl ConnectivityManagerBuilder {
         self.connectivity_manager = Some({
             ConnectivityManager::new(
                 config.network_context,
+                config.time_service,
                 config.eligible,
-                config.seed_addrs,
-                config.seed_pubkeys,
-                IntervalStream::new(interval(Duration::from_millis(
-                    config.connectivity_check_interval_ms,
-                )))
-                .fuse(),
+                &config.seeds,
                 config.connection_reqs_tx,
                 config.connection_notifs_rx,
                 config.requests_rx,
+                Duration::from_millis(config.connectivity_check_interval_ms),
                 ExponentialBackoff::from_millis(config.backoff_base).factor(1000),
-                config.max_connection_delay_ms,
+                Duration::from_millis(config.max_connection_delay_ms),
                 config.outbound_connection_limit,
             )
         });

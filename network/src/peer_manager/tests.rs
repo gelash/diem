@@ -13,22 +13,26 @@ use crate::{
         messaging::v1::{ErrorCode, NetworkMessage, NetworkMessageSink, NetworkMessageStream},
     },
     transport,
-    transport::{Connection, ConnectionId, ConnectionMetadata, TrustLevel},
+    transport::{Connection, ConnectionId, ConnectionMetadata},
     ProtocolId,
 };
 use anyhow::anyhow;
 use bytes::Bytes;
 use channel::{diem_channel, message_queues::QueueStyle};
-use diem_config::{config::MAX_INBOUND_CONNECTIONS, network_id::NetworkContext};
-use diem_network_address::NetworkAddress;
+use diem_config::{
+    config::{PeerRole, MAX_INBOUND_CONNECTIONS},
+    network_id::NetworkContext,
+};
+use diem_infallible::RwLock;
 use diem_rate_limiter::rate_limit::TokenBucketRateLimiter;
-use diem_types::PeerId;
+use diem_time_service::TimeService;
+use diem_types::{network_address::NetworkAddress, PeerId};
 use futures::{channel::oneshot, io::AsyncWriteExt, stream::StreamExt};
 use memsocket::MemorySocket;
 use netcore::transport::{
     boxed::BoxedTransport, memory::MemoryTransport, ConnectionOrigin, TransportExt,
 };
-use std::{collections::HashMap, iter::FromIterator};
+use std::{collections::HashMap, sync::Arc};
 use tokio::runtime::Handle;
 use tokio_util::compat::{
     FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt,
@@ -54,7 +58,7 @@ pub fn build_test_transport(
                     origin,
                     MessagingProtocolVersion::V1,
                     [TEST_PROTOCOL].iter().into(),
-                    TrustLevel::Untrusted,
+                    PeerRole::Unknown,
                 ),
             })
         })
@@ -95,12 +99,14 @@ fn build_test_peer_manager(
 
     let peer_manager = PeerManager::new(
         executor,
+        TimeService::mock(),
         build_test_transport(),
         NetworkContext::mock_with_peer_id(peer_id),
         "/memory/0".parse().unwrap(),
+        Arc::new(RwLock::new(HashMap::new())),
         peer_manager_request_rx,
         connection_reqs_rx,
-        HashMap::from_iter([(TEST_PROTOCOL, hello_tx)].iter().cloned()),
+        [(TEST_PROTOCOL, hello_tx)].iter().cloned().collect(),
         vec![conn_status_tx],
         constants::NETWORK_CHANNEL_SIZE,
         constants::MAX_CONCURRENT_NETWORK_REQS,
@@ -233,7 +239,7 @@ fn create_connection<TSocket: transport::TSocket>(
             origin,
             MessagingProtocolVersion::V1,
             [TEST_PROTOCOL].iter().into(),
-            TrustLevel::Untrusted,
+            PeerRole::Unknown,
         ),
     }
 }
@@ -558,7 +564,7 @@ fn peer_manager_simultaneous_dial_disconnect_event() {
                 ConnectionOrigin::Inbound,
                 MessagingProtocolVersion::V1,
                 [TEST_PROTOCOL].iter().into(),
-                TrustLevel::Untrusted,
+                PeerRole::Unknown,
             ),
             DisconnectReason::ConnectionLost,
         );
@@ -613,7 +619,7 @@ fn test_dial_disconnect() {
                 ConnectionOrigin::Outbound,
                 MessagingProtocolVersion::V1,
                 [TEST_PROTOCOL].iter().into(),
-                TrustLevel::Untrusted,
+                PeerRole::Unknown,
             ),
             DisconnectReason::Requested,
         );

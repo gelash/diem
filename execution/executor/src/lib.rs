@@ -36,14 +36,14 @@ use diem_logger::prelude::*;
 use diem_state_view::StateViewId;
 use diem_trace::prelude::*;
 use diem_types::{
-    account_address::AccountAddress,
+    account_address::{AccountAddress, HashAccountAddress},
     account_state::AccountState,
     account_state_blob::AccountStateBlob,
     contract_event::ContractEvent,
     epoch_state::EpochState,
     ledger_info::LedgerInfoWithSignatures,
     on_chain_config,
-    proof::{accumulator::InMemoryAccumulator, SparseMerkleProof},
+    proof::accumulator::InMemoryAccumulator,
     transaction::{
         Transaction, TransactionInfo, TransactionListWithProof, TransactionOutput,
         TransactionPayload, TransactionStatus, TransactionToCommit, Version,
@@ -63,6 +63,9 @@ use std::{
     sync::Arc,
 };
 use storage_interface::{state_view::VerifiedStateView, DbReaderWriter, TreeState};
+
+type SparseMerkleProof = diem_types::proof::SparseMerkleProof<AccountStateBlob>;
+type SparseMerkleTree = scratchpad::SparseMerkleTree<AccountStateBlob>;
 
 /// `Executor` implements all functionalities the execution module needs to provide.
 pub struct Executor<V> {
@@ -514,7 +517,9 @@ where
                 TransactionStatus::Keep(recorded_status) => recorded_status.clone(),
                 status @ TransactionStatus::Discard(_) => bail!(
                     "The transaction at version {}, got the status of 'Discard': {:?}",
-                    first_version + i as u64,
+                    first_version
+                        .checked_add(i as u64)
+                        .ok_or_else(|| format_err!("version + i overflows"))?,
                     status
                 ),
                 TransactionStatus::Retry => {
@@ -576,7 +581,11 @@ where
         ensure!(
             txns_to_retry.is_empty(),
             "The transaction at version {} got the status of 'Retry'",
-            num_txns - txns_to_retry.len() + first_version as usize,
+            num_txns
+                .checked_sub(txns_to_retry.len())
+                .ok_or_else(|| format_err!("integer overflow occurred"))?
+                .checked_add(first_version as usize)
+                .ok_or_else(|| format_err!("integer overflow occurred"))?,
         );
 
         Ok((processed_vm_output, txns_to_commit, events))
@@ -694,7 +703,10 @@ impl<V: VMExecutor> TransactionReplayer for Executor<V> {
     }
 
     fn expecting_version(&self) -> Version {
-        self.cache.synced_trees().version().map_or(0, |v| v + 1)
+        self.cache
+            .synced_trees()
+            .version()
+            .map_or(0, |v| v.checked_add(1).expect("Integer overflow occurred"))
     }
 }
 

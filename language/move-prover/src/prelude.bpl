@@ -45,7 +45,7 @@ function $DebugTrackAbort(file_id: int, byte_index: int, code: int) : bool {
 }
 
 // Tracks the $Value of a specification (sub-)expression.
-function $DebugTrackExp(module_id: int, node_id: int, $Value: $Value) : $Value { $Value }
+function $DebugTrackExp(node_id: int, $Value: $Value) : $Value { $Value }
 
 
 // Path type
@@ -335,6 +335,49 @@ function {{backend.func_inline}} $ContainValueArray(a: $ValueArray, v: $Value): 
 {{/if}} //end of backend.vector_using_sequences
 
 
+// This is the implementation of $ValueMultiset
+
+type {:datatype} $ValueMultiset;
+
+function {:constructor} $ValueMultiset(v: [$Value]int, l: int): $ValueMultiset;
+
+function {:builtin "MapConst"} $MapConstInt(l: int): [$Value]int;
+
+const $EmptyValueMultiset: $ValueMultiset;
+axiom $IsEmptyValueMultiset($EmptyValueMultiset);
+
+function {{backend.func_inline}} $LenValueMultiset(s: $ValueMultiset): int {
+    l#$ValueMultiset(s)
+}
+
+function {{backend.func_inline}} $ExtendValueMultiset(s: $ValueMultiset, v: $Value): $ValueMultiset {
+    (var len := l#$ValueMultiset(s);
+    (var cnt := v#$ValueMultiset(s)[v];
+    $ValueMultiset(v#$ValueMultiset(s)[v := (cnt + 1)], len + 1)))
+}
+
+// This function returns (s1 - s2). This function assumes that s2 is a subset of s1.
+function {{backend.func_inline}} $SubtractValueMultiset(s1: $ValueMultiset, s2: $ValueMultiset): $ValueMultiset {
+    (var len1 := l#$ValueMultiset(s1);
+    (var len2 := l#$ValueMultiset(s2);
+    $ValueMultiset((lambda v:$Value :: v#$ValueMultiset(s1)[v]-v#$ValueMultiset(s2)[v]), len1-len2)))
+}
+
+function {:inline} $IsEmptyValueMultiset(s: $ValueMultiset): bool {
+    (l#$ValueMultiset(s) == 0) &&
+    (forall v: $Value :: v#$ValueMultiset(s)[v] == 0)
+}
+
+function {:inline} $IsSubsetValueMultiset(s1: $ValueMultiset, s2: $ValueMultiset): bool {
+    (l#$ValueMultiset(s1) <= l#$ValueMultiset(s2)) &&
+    (forall v: $Value :: v#$ValueMultiset(s1)[v] <= v#$ValueMultiset(s2)[v])
+}
+
+function {{backend.func_inline}} $ContainValueMultiset(s: $ValueMultiset, v: $Value): bool {
+    v#$ValueMultiset(s)[v] > 0
+}
+
+
 // Stratified Functions on Values
 // ------------------------------
 
@@ -463,6 +506,11 @@ function {:inline} $vlen(v: $Value): int {
     $LenValueArray(v#$Vector(v))
 }
 
+function {:inline} $vlen_raw(v: $ValueArray): int {
+    $LenValueArray(v)
+}
+
+
 // Check that all invalid elements of vector are DefaultValue
 function {:inline} $is_normalized_vector(v: $Value): bool {
     $IsNormalizedValueArray(v#$Vector(v), $vlen(v))
@@ -472,6 +520,7 @@ function {:inline} $is_normalized_vector(v: $Value): bool {
 function {:inline} $vlen_value(v: $Value): $Value {
     $Integer($vlen(v))
 }
+
 function {:inline} $mk_vector(): $Value {
     $Vector($EmptyValueArray())
 }
@@ -493,12 +542,20 @@ function {:inline} $reverse_vector(v: $Value): $Value {
 function {:inline} $update_vector(v: $Value, i: int, elem: $Value): $Value {
     $Vector($UpdateValueArray(v#$Vector(v), i, elem))
 }
+function {:inline} $update_vector_raw(v: $ValueArray, i: int, elem: $Value): $ValueArray {
+    $UpdateValueArray(v, i, elem)
+}
 // $update_vector_by_value requires index to be a Value, not int.
 function {:inline} $update_vector_by_value(v: $Value, i: $Value, elem: $Value): $Value {
     $Vector($UpdateValueArray(v#$Vector(v), i#$Integer(i), elem))
 }
+
+
 function {:inline} $select_vector(v: $Value, i: int) : $Value {
     $ReadValueArray(v#$Vector(v), i)
+}
+function {:inline} $select_vector_raw(v: $ValueArray, i: int) : $Value {
+    $ReadValueArray(v, i)
 }
 // $select_vector_by_value requires index to be a Value, not int.
 function {:inline} $select_vector_by_value(v: $Value, i: $Value) : $Value {
@@ -509,6 +566,9 @@ function {:inline} $swap_vector(v: $Value, i: int, j: int): $Value {
 }
 function {:inline} $slice_vector(v: $Value, r: $Value) : $Value {
     $Vector($SliceValueArray(v#$Vector(v), i#$Integer(lb#$Range(r)), i#$Integer(ub#$Range(r))))
+}
+function {:inline} $slice_vector_raw(v: $ValueArray, r: $Value) : $ValueArray {
+    $SliceValueArray(v, i#$Integer(lb#$Range(r)), i#$Integer(ub#$Range(r)))
 }
 function {:inline} $InVectorRange(v: $Value, i: int): bool {
     i >= 0 && i < $vlen(v)
@@ -567,28 +627,70 @@ const $EmptyMemory: $Memory;
 axiom domain#$Memory($EmptyMemory) == $ConstMemoryDomain(false);
 axiom contents#$Memory($EmptyMemory) == $ConstMemoryContent($DefaultValue());
 
+// Returns a new memory which is identical than the given memory except at (type_args, addr) which
+// is arbitrary.
+procedure {:inline 1} $Modifies(m: $Memory, type_args: $TypeValueArray, addr: int) returns (m': $Memory) {
+    m' := $Memory(
+        domain#$Memory(m)[type_args, addr := domain#$Memory(m')[type_args, addr]],
+        contents#$Memory(m)[type_args, addr := contents#$Memory(m')[type_args, addr]]
+    );
+}
+
 // ============================================================================================
 // EventStore
 
 // Representation of EventStore that consists of event streams. The map `streams` takes GUIDs (with type of $Value),
 // and returns sequences of messages (with type of $ValueArray).
 type {:datatype} $EventStore;
-function {:constructor} $EventStore(streams: [$Value]$ValueArray): $EventStore;
+function {:constructor} $EventStore(counter: int, streams: [$Value]$ValueMultiset): $EventStore;
 
 function {:inline} $EventStore__is_well_formed(es: $EventStore): bool {
     true
 }
 
 function {:inline} $EventStore__is_empty(es: $EventStore): bool {
+    (counter#$EventStore(es) == 0) &&
     (forall guid: $Value ::
         (var stream := streams#$EventStore(es)[guid];
-        $IsEmpty(stream) && $IsNormalizedValueArray(stream, 0)))
+        $IsEmptyValueMultiset(stream)))
 }
 
-function {:builtin "MapConst"} $ConstEventStoreContent(v: $Value): [$Value]$ValueArray;
+// This function returns (es1 - es2). This function assumes that es2 is a subset of es1.
+function {:inline} $EventStore__subtract(es1: $EventStore, es2: $EventStore): $EventStore {
+    $EventStore(counter#$EventStore(es1)-counter#$EventStore(es2),
+        (lambda guid: $Value ::
+        $SubtractValueMultiset(
+            streams#$EventStore(es1)[guid],
+            streams#$EventStore(es2)[guid])))
+}
+
+function {:inline} $EventStore__is_subset(es1: $EventStore, es2: $EventStore): bool {
+    (counter#$EventStore(es1) <= counter#$EventStore(es2)) &&
+    (forall guid: $Value ::
+        $IsSubsetValueMultiset(
+            streams#$EventStore(es1)[guid],
+            streams#$EventStore(es2)[guid]
+        )
+    )
+}
+
+function {:builtin "MapConst"} $ConstEventStoreContent(s: $ValueMultiset): [$Value]$ValueMultiset;
 
 const $EmptyEventStore: $EventStore;
-axiom streams#$EventStore($EmptyEventStore) == $ConstEventStoreContent($DefaultValue());
+axiom $EventStore__is_empty($EmptyEventStore);
+
+function {:inline} $ExtendEventStore(es: $EventStore, guid: $Value, msg: $Value): $EventStore {
+    (var stream := streams#$EventStore(es)[guid];
+    (var stream_new := $ExtendValueMultiset(stream, msg);
+    $EventStore(counter#$EventStore(es)+1, streams#$EventStore(es)[guid := stream_new])))
+}
+
+function {:inline} $CondExtendEventStore(es: $EventStore, guid: $Value, msg: $Value, cond: $Value): $EventStore {
+    if b#$Boolean(cond) then
+        $ExtendEventStore(es, guid, msg)
+    else
+        es
+}
 
 var $es: $EventStore;
 
@@ -632,6 +734,9 @@ function {:inline} $ResourceExists(m: $Memory, args: $TypeValueArray, addr: $Val
 }
 
 // Obtains Value of given resource.
+function {:inline} $ResourceValueRaw(m: $Memory, args: $TypeValueArray, addr: int): $Value {
+  contents#$Memory(m)[args, addr]
+}
 function {:inline} $ResourceValue(m: $Memory, args: $TypeValueArray, addr: $Value): $Value {
   contents#$Memory(m)[args, a#$Address(addr)]
 }
@@ -641,9 +746,19 @@ function {:inline} $SelectField(val: $Value, field: $FieldName): $Value {
     $select_vector(val, field)
 }
 
+// Applies a field selection to a raw value array.
+function {:inline} $SelectFieldRaw(val: $ValueArray, field: $FieldName): $Value {
+    $select_vector_raw(val, field)
+}
+
 // Updates a field.
 function {:inline} $UpdateField(val: $Value, field: $FieldName, new_value: $Value): $Value {
     $update_vector(val, field, new_value)
+}
+
+// Updates a field, raw.
+function {:inline} $UpdateFieldRaw(val: $ValueArray, field: $FieldName, new_value: $Value): $ValueArray {
+    $update_vector_raw(val, field, new_value)
 }
 
 
@@ -762,7 +877,7 @@ procedure {:inline 1} $CopyOrMoveValue(local: $Value) returns (dst: $Value)
     dst := local;
 }
 
-procedure {:inline 1} $WritebackToGlobal(m: $Memory, src: $Mutation) returns (m': $Memory)
+procedure {:inline 1} $WritebackToGlobalWeak(m: $Memory, src: $Mutation) returns (m': $Memory)
 {
     var l: $Location;
     var ta: $TypeValueArray;
@@ -780,7 +895,7 @@ procedure {:inline 1} $WritebackToGlobal(m: $Memory, src: $Mutation) returns (m'
     }
 }
 
-procedure {:inline 1} $WritebackToValue(src: $Mutation, idx: int, vdst: $Value) returns (vdst': $Value)
+procedure {:inline 1} $WritebackToValueWeak(src: $Mutation, idx: int, vdst: $Value) returns (vdst': $Value)
 {
     if (l#$Mutation(src) == $Local(idx)) {
         vdst' := $UpdateValue(p#$Mutation(src), 0, vdst, v#$Mutation(src));
@@ -789,7 +904,7 @@ procedure {:inline 1} $WritebackToValue(src: $Mutation, idx: int, vdst: $Value) 
     }
 }
 
-procedure {:inline 1} $WritebackToReference(src: $Mutation, dst: $Mutation) returns (dst': $Mutation)
+procedure {:inline 1} $WritebackToReferenceWeak(src: $Mutation, dst: $Mutation) returns (dst': $Mutation)
 {
     var srcPath, dstPath: $Path;
 
@@ -800,6 +915,67 @@ procedure {:inline 1} $WritebackToReference(src: $Mutation, dst: $Mutation) retu
                     l#$Mutation(dst),
                     dstPath,
                     $UpdateValue(srcPath, size#$Path(dstPath), v#$Mutation(dst), v#$Mutation(src)));
+    } else {
+        dst' := dst;
+    }
+}
+
+procedure {:inline 1} $WritebackToGlobalStrong(m: $Memory, src: $Mutation) returns (m': $Memory)
+{
+    var l: $Location;
+    var ta: $TypeValueArray;
+    var a: int;
+    var v: $Value;
+
+    l := l#$Mutation(src);
+    if (is#$Global(l)) {
+        ta := ts#$Global(l);
+        a := a#$Global(l);
+        v := v#$Mutation(src);
+        m' := $Memory(domain#$Memory(m), contents#$Memory(m)[ta, a := v]);
+    } else {
+        m' := m;
+    }
+}
+
+procedure {:inline 1} $WritebackToValueStrong(src: $Mutation, idx: int, vdst: $Value) returns (vdst': $Value)
+{
+    if (l#$Mutation(src) == $Local(idx)) {
+        vdst' := v#$Mutation(src);
+    } else {
+        vdst' := vdst;
+    }
+}
+
+procedure {:inline 1} $WritebackToReferenceStrongEmp(src: $Mutation, dst: $Mutation) returns (dst': $Mutation)
+{
+    var srcPath, dstPath: $Path;
+
+    srcPath := p#$Mutation(src);
+    dstPath := p#$Mutation(dst);
+    if (l#$Mutation(dst) == l#$Mutation(src) && size#$Path(dstPath) <= size#$Path(srcPath) && $IsPathPrefix(dstPath, srcPath)) {
+        dst' := $Mutation(
+                    l#$Mutation(dst),
+                    dstPath,
+                    v#$Mutation(dst));
+    } else {
+        dst' := dst;
+    }
+}
+
+procedure {:inline 1} $WritebackToReferenceStrongOff(src: $Mutation, dst: $Mutation, edge: $FieldName)
+returns (dst': $Mutation)
+{
+    var srcPath, dstPath: $Path;
+
+    srcPath := p#$Mutation(src);
+    dstPath := p#$Mutation(dst);
+    if (l#$Mutation(dst) == l#$Mutation(src)) {
+        dst' := $Mutation(
+                    l#$Mutation(dst),
+                    dstPath,
+                    $Vector($UpdateValueArray(v#$Vector(v#$Mutation(dst)), edge, v#$Mutation(src)))
+                    );
     } else {
         dst' := dst;
     }
@@ -918,23 +1094,43 @@ function $shr(src1: $Value, src2: $Value): $Value {
    )
 }
 
+// Note that *not* inlining the shl/shr functions avoids timeouts. It appears that Z3 can reason
+// better about this if it is an axiomatized function.
+function $shl_raw(src1: int, p: int): int {
+    if p == 8 then src1 * 256
+    else if p == 16 then src1 * 65536
+    else if p == 32 then src1 * 4294967296
+    else if p == 64 then src1 * 18446744073709551616
+    // Value is undefined, otherwise.
+    else -1
+}
+
+function $shr_raw(src1: int, p: int): int {
+    if p == 8 then src1 div 256
+    else if p == 16 then src1 div 65536
+    else if p == 32 then src1 div 4294967296
+    else if p == 64 then src1 div 18446744073709551616
+    // Value is undefined, otherwise.
+    else -1
+}
+
 // TODO: fix this and $Shr to drop bits on overflow. Requires $Shl8, $Shl64, and $Shl128
 procedure {:inline 1} $Shl(src1: $Value, src2: $Value) returns (dst: $Value)
 requires is#$Integer(src1) && is#$Integer(src2);
 {
-    var po2: int;
-    po2 := $power_of_2(src2);
-    assert po2 >= 1;   // restriction: shift argument must be 8, 16, 32, or 64
-    dst := $Integer(i#$Integer(src1) * po2);
+    var res: int;
+    res := $shl_raw(i#$Integer(src1), i#$Integer(src2));
+    assert res >= 0;   // restriction: shift argument must be 8, 16, 32, or 64
+    dst := $Integer(res);
 }
 
 procedure {:inline 1} $Shr(src1: $Value, src2: $Value) returns (dst: $Value)
 requires is#$Integer(src1) && is#$Integer(src2);
 {
-    var po2: int;
-    po2 := $power_of_2(src2);
-    assert po2 >= 1;   // restriction: shift argument must be 8, 16, 32, or 64
-    dst := $Integer(i#$Integer(src1) div po2);
+    var res: int;
+    res := $shr_raw(i#$Integer(src1), i#$Integer(src2));
+    assert res >= 0;   // restriction: shift argument must be 8, 16, 32, or 64
+    dst := $Integer(res);
 }
 
 procedure {:inline 1} $MulU8(src1: $Value, src2: $Value) returns (dst: $Value)
@@ -1061,8 +1257,7 @@ function {:inline} $Vector_$is_well_formed(v: $Value): bool {
         var va := v#$Vector(v);
         (
             var l := l#$ValueArray(va);
-            0 <= l && l <= $MAX_U64 &&
-            (forall x: int :: {v#$ValueArray(va)[x]} x < 0 || x >= l ==> v#$ValueArray(va)[x] == $DefaultValue())
+            0 <= l && l <= $MAX_U64
         )
     )
 }
@@ -1450,10 +1645,7 @@ procedure {:inline 1} $Event_emit_event(t: $TypeValue, handler: $Value, msg: $Va
 }
 
 procedure {:inline 1} $Event_write_to_event_store(t: $TypeValue, guid: $Value, count: $Value, msg: $Value) {
-    var stream, stream_new: $ValueArray;
-    stream := streams#$EventStore($es)[guid];
-    stream_new := $ExtendValueArray(stream, msg);
-    $es := $EventStore(streams#$EventStore($es)[guid := stream_new]);
+    $es := $ExtendEventStore($es, guid, msg);
 }
 
 procedure {:inline 1} $Event_destroy_handle(t: $TypeValue, handle: $Value) {

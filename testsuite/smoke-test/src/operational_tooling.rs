@@ -12,6 +12,7 @@ use crate::{
         write_key_to_file_hex_format,
     },
 };
+use diem_client::views::VMStatusView;
 use diem_config::config::SecureBackend;
 use diem_crypto::{
     ed25519::{Ed25519PrivateKey, Ed25519PublicKey},
@@ -23,13 +24,12 @@ use diem_global_constants::{
 };
 use diem_key_manager::diem_interface::DiemInterface;
 use diem_management::storage::to_x25519;
-use diem_network_address::NetworkAddress;
 use diem_operational_tool::test_helper::OperationalTool;
-use diem_secure_json_rpc::VMStatusView;
 use diem_secure_storage::{CryptoStorage, KVStorage, Storage};
 use diem_types::{
     account_address::AccountAddress, block_info::BlockInfo, ledger_info::LedgerInfo,
-    transaction::authenticator::AuthenticationKey, waypoint::Waypoint,
+    network_address::NetworkAddress, transaction::authenticator::AuthenticationKey,
+    waypoint::Waypoint,
 };
 use rand::rngs::OsRng;
 use std::{
