@@ -75,7 +75,6 @@ use diem_crypto::{
 use diem_types::{
     proof::{SparseMerkleInternalNode, SparseMerkleLeafNode, SparseMerkleProof}
 };
-use itertools::sorted;
 use std::sync::Arc;
 use std::cmp;
 
@@ -125,29 +124,36 @@ where
     }
 
     /// Constructs a new Sparse Merkle Tree after applying bulk of updates from a sequence of
-    /// n transactions. Each update is of form (addr_hash, txn_id, value), where 0 <= txn_id < n.
-    /// Since the tree is immutable, the existing tree will remain the same and may share
-    /// parts with the new, returned tree. Function also returns a vector of n-1 hashes, which
-    /// would be the intedmediate root hashes if we serially applied the updates of transactions.
+    /// n transactions. Each update is of form (addr_hash, txn_id, value), where 0 <= txn_id < n
+    /// and the txn_id's are sorted. Since the tree is immutable, the existing tree will remain
+    /// the same and may share parts with the new, returned tree. Function also returns a vector
+    /// of n-1 hashes, which would be the intedmediate root hashes if we serially applied the
+    /// updates of transactions.
     pub fn bulk_update(
         &self,
-        updates: Vec<(HashValue, usize, &V)>,
-        proof_reader: &impl ProofRead,
+        update_batches: Vec<Vec<(HashValue, &V)>>,
+        proof_reader: &impl ProofRead<V>,
     ) -> Result<(Self, Vec<HashValue>), UpdateError> {
+        let updates: Vec<(HashValue, usize, &V)> = update_batches
+            .iter()
+            .enumerate()
+            .map(|(i, batch)| batch.iter().map(move |&(hash, value)| (hash, i, value)))
+            .flatten()
+            .collect();
+        
         let (root, hashes) = Self::bulk_update_existing_tree(Arc::clone(&self.root),
+                                                             vec![],
                                                              0,
                                                              &updates,
                                                              (0..updates.len()).collect(),
                                                              proof_reader)?;
-
-        
-        
+                
         Ok((SparseMerkleTree { root },
             hashes.into_iter().skip(1).map(|(_, hash)| hash).collect()))
     }
 
     // Partition indices vector into two vectors, based on the bit value at bit_index of
-    // the Hashvalue stored at updates[index].
+    // the Hashvalue stored at updates[index]. The order is maintained.
     fn partition_indices(
         updates: &Vec<(HashValue, usize, &V)>,
         indices: Vec<usize>,
@@ -163,13 +169,18 @@ where
     fn all_keys_equal_to(
         updates: &Vec<(HashValue, usize, &V)>,
         indices: &Vec<usize>,
+        maybe_key: Option<HashValue>
     ) -> Option<HashValue> {
         match indices.len() {
             0 => None,
             _ => {
-                let first_hashvalue = updates[indices[0]].0;
-                if indices.into_iter().all(|&i| updates[i].0 == first_hashvalue) {
-                    Some(first_hashvalue)
+                let base_hashvalue = match maybe_key {
+                    Some(key) => key,
+                    None => updates[indices[0]].0,
+                };
+                
+                if indices.into_iter().all(|&i| updates[i].0 == base_hashvalue) {
+                    Some(base_hashvalue)
                 } else {
                     None
                 }
@@ -177,18 +188,20 @@ where
         }
     }
 
+    // Given a leaf's original hash, key and transactions tha affect it (described by
+    // the relevant update indices), produce intermediate hashes and resulting leaf node.
+    // Indices must be increasing and updates.1 (txn_num's) must be non-decreasing.
     fn process_leaf_txn_hashes(
         before_hash: HashValue,
         key: HashValue,
         updates: &Vec<(HashValue, usize, &V)>,
         indices: &Vec<usize>,
-    ) -> (Arc<SparseMerkleNode>, Vec<(usize, HashValue)>) {
+    ) -> (Arc<SparseMerkleNode<V>>, Vec<(usize, HashValue)>) {
         let mut hashes = vec![(0, before_hash)];
 
-        let txn_and_update_index: Vec<(usize, usize)> = sorted(
-            indices
-                .iter()
-                .map(|&i| (updates[i].1 + 1, i)))
+        let txn_and_update_index: Vec<(usize, usize)> = indices
+            .iter()
+            .map(|&i| (updates[i].1 + 1, i))
             .collect();
 
         txn_and_update_index
@@ -256,26 +269,31 @@ where
     }
 
     fn construct_internal_node(
-        left_child: Arc<SparseMerkleNode>,
-        right_child: Arc<SparseMerkleNode>,
+        left_child: Arc<SparseMerkleNode<V>>,
+        left_siblings: Vec<HashValue>,
+        right_child: Arc<SparseMerkleNode<V>>,
+        right_siblings: Vec<HashValue>,
         node_depth: usize,
         updates: &Vec<(HashValue, usize, &V)>,
         subtree_update_indices: Vec<usize>,
-        proof_reader: &impl ProofRead,
-    ) -> Result<(Arc<SparseMerkleNode>, Vec<(usize, HashValue)>), UpdateError> {
+        proof_reader: &impl ProofRead<V>,
+    ) -> Result<(Arc<SparseMerkleNode<V>>, Vec<(usize, HashValue)>), UpdateError> {
         let (left_indices, right_indices) =
             Self::partition_indices(updates,
                                     subtree_update_indices,
                                     node_depth);
-        
+
+        // TODO: execute these calls in parallel up to a certain depth.
         let (left_child, left_txn_hashes) =
             Self::bulk_update_existing_tree(left_child,
+                                            left_siblings,
                                             node_depth + 1,
                                             updates,
                                             left_indices,
                                             proof_reader)?;
         let (right_child, right_txn_hashes) =
             Self::bulk_update_existing_tree(right_child,
+                                            right_siblings,
                                             node_depth + 1,
                                             updates,
                                             right_indices,
@@ -291,49 +309,125 @@ where
     
     // Returns the new subtree and a vector of pairs (txn_num, hash_value), where hash_value
     // would be the hash of the root of the subtree if only first txn_num many transactions
-    // were applied. Only relevant txn_num values are included (i.e. if a transaction didn't
-    // affect the given subtree, it will be skipped).
+    // were applied. txn_num = 0 is always included with the original hash. Only relevant
+    // txn_num values appear (i.e. if a transaction didn't affect the given subtree,
+    // it will be skipped), and they will be sorted.
+    // subtree_update_indices must be increasing, and updates.1 must be non-decreasing.
     fn bulk_update_existing_tree(
-        subtree_root: Arc<SparseMerkleNode>,
+        subtree_root: Arc<SparseMerkleNode<V>>,
+        siblings: Vec<HashValue>,
         subtree_depth: usize,
         updates: &Vec<(HashValue, usize, &V)>,
         subtree_update_indices: Vec<usize>,
-        proof_reader: &impl ProofRead,
-    ) -> Result<(Arc<SparseMerkleNode>, Vec<(usize, HashValue)>), UpdateError> {
+        proof_reader: &impl ProofRead<V>,
+    ) -> Result<(Arc<SparseMerkleNode<V>>, Vec<(usize, HashValue)>), UpdateError> {
+        let subtree_hash = subtree_root.read_lock().hash();
         if subtree_update_indices.len() == 0 {
-            let subtree_hash = subtree_root.read_lock().hash();
             return Ok((subtree_root, vec![(0, subtree_hash)]));
         }
 
-        // Deal with subtree case.
-        
-        match &*subtree_root.read_lock() {
-            Node::Internal(node) => Self::construct_internal_node(
+        if let Node::Internal(node) = &*subtree_root.read_lock() {
+            Self::construct_internal_node(
                 node.clone_left_child(),
+                vec![],
                 node.clone_right_child(),
+                vec![],
                 subtree_depth,
                 updates,
                 subtree_update_indices,
-                proof_reader),
-            Node::Empty => {
-                match Self::all_keys_equal_to(updates, &subtree_update_indices) {
-                    Some(key) => {
-                        Ok(Self::process_leaf_txn_hashes(*SPARSE_MERKLE_PLACEHOLDER_HASH,
-                                                         key,
-                                                         updates,
-                                                         &subtree_update_indices))
-                    }
-                    None => Self::construct_internal_node(
-                        Arc::new(SparseMerkleNode::new_empty()),
-                        Arc::new(SparseMerkleNode::new_empty()),
+                proof_reader)
+        } else if let Node::Subtree(_) = &*subtree_root.read_lock() {
+            let proof = proof_reader
+                .get_proof(updates[subtree_update_indices[0]].0)
+                .ok_or(UpdateError::MissingProof)?;
+
+            let (new_subtree_root, new_siblings) = match proof.leaf() {
+                Some(existing_leaf) => {
+                    let leaf_node : &LeafNode<V> = &existing_leaf.into();
+                    (Arc::new(SparseMerkleNode::new_leaf(
+                        existing_leaf.key(),
+                        leaf_node.value().clone())),
+                     proof.siblings().into_iter().rev().map(|h| *h).collect())
+                }
+                None => (Arc::new(SparseMerkleNode::new_empty()), vec![]),
+            };
+
+            Self::bulk_update_existing_tree(
+                new_subtree_root,
+                new_siblings,
+                subtree_depth,
+                updates,
+                subtree_update_indices,
+                proof_reader)
+        } else {
+            // Leaf or empty
+            let leaf_key = if let Node::Leaf(leaf) = &*subtree_root.read_lock() {
+                Some(leaf.key())
+            } else {
+                None
+            };
+            
+            match Self::all_keys_equal_to(updates,
+                                          &subtree_update_indices,
+                                          leaf_key) {
+                Some(key) => {
+                    let leaf_hash = if leaf_key.is_some() {
+                        subtree_hash
+                    } else
+                    {
+                        *SPARSE_MERKLE_PLACEHOLDER_HASH
+                    };
+                    
+                    Ok(Self::process_leaf_txn_hashes(leaf_hash,
+                                                     key,
+                                                     updates,
+                                                     &subtree_update_indices))
+                }
+                None => {
+                    let (left_child, left_siblings, right_child, right_siblings) =
+                        match leaf_key {
+                            Some(key) => {
+
+                                let sibling_hash = siblings
+                                    .get(subtree_depth)
+                                    .unwrap_or(&SPARSE_MERKLE_PLACEHOLDER_HASH);
+                                
+                                let sibling_node = Arc::new(
+                                    if *sibling_hash != *SPARSE_MERKLE_PLACEHOLDER_HASH {
+                                        SparseMerkleNode::new_subtree(*sibling_hash)
+                                    } else {
+                                        SparseMerkleNode::new_empty()
+                                    });
+                                
+                                if key.get_bit(subtree_depth) {
+                                    (sibling_node,
+                                     vec![],
+                                     Arc::clone(&subtree_root),
+                                     siblings)
+                                } else {
+                                    (Arc::clone(&subtree_root),
+                                     siblings,
+                                     sibling_node,
+                                     vec![])
+                                }
+                            }
+                            None =>
+                                (Arc::new(SparseMerkleNode::new_empty()),
+                                 vec![],
+                                 Arc::new(SparseMerkleNode::new_empty()),
+                                 vec![])
+                        };
+
+                    Self::construct_internal_node(
+                        left_child,
+                        left_siblings,
+                        right_child,
+                        right_siblings,
                         subtree_depth,
                         updates,
                         subtree_update_indices,
-                        proof_reader),
+                        proof_reader)
                 }
-            }
-            _ => {
-                unreachable!("Not yet implemented.")
             }
         }
     }
@@ -422,7 +516,7 @@ where
                 HashValue::LENGTH_IN_BITS - remaining_bits.len(),
             )),
             Node::Subtree(_) => {
-                // When the search reaches an Subtree node, we need proof to give us more
+                // When the search reaches a Subtree node, we need proof to give us more
                 // information about this part of the tree.
                 let proof = proof_reader
                     .get_proof(key)
