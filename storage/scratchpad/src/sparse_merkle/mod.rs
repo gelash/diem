@@ -306,6 +306,46 @@ where
                                                        right_txn_hashes);
         Ok((new_subtree_root, merged_txn_hashes))
     }
+
+    fn children_and_siblings(
+        subtree_root_clone: Arc<SparseMerkleNode<V>>,
+        child_key: Option<HashValue>,
+        siblings: Vec<HashValue>,
+        subtree_depth: usize,
+    ) -> (Arc<SparseMerkleNode<V>>, Vec<HashValue>, Arc<SparseMerkleNode<V>>, Vec<HashValue>) {
+        match child_key {
+            Some(key) => {
+                let sibling_hash = siblings
+                    .get(subtree_depth)
+                    .unwrap_or(&SPARSE_MERKLE_PLACEHOLDER_HASH);
+                
+                let sibling_node = Arc::new(
+                    if *sibling_hash != *SPARSE_MERKLE_PLACEHOLDER_HASH {
+                        SparseMerkleNode::new_subtree(*sibling_hash)
+                    } else {
+                        SparseMerkleNode::new_empty()
+                    });
+                
+                if key.get_bit(subtree_depth) {
+                    (sibling_node,
+                     vec![],
+                     subtree_root_clone,
+                     siblings)
+                } else {
+                    (subtree_root_clone,
+                     siblings,
+                     sibling_node,
+                     vec![])
+                }
+            }
+            None =>
+                (Arc::new(SparseMerkleNode::new_empty()),
+                 vec![],
+                 Arc::new(SparseMerkleNode::new_empty()),
+                 vec![])
+        }
+    }
+        
     
     // Returns the new subtree and a vector of pairs (txn_num, hash_value), where hash_value
     // would be the hash of the root of the subtree if only first txn_num many transactions
@@ -341,20 +381,19 @@ where
                 .get_proof(updates[subtree_update_indices[0]].0)
                 .ok_or(UpdateError::MissingProof)?;
 
-            let (new_subtree_root, new_siblings) = match proof.leaf() {
+            let new_subtree_root = Arc::new(match proof.leaf() {
                 Some(existing_leaf) => {
                     let leaf_node : &LeafNode<V> = &existing_leaf.into();
-                    (Arc::new(SparseMerkleNode::new_leaf(
+                    SparseMerkleNode::new_leaf(
                         existing_leaf.key(),
-                        leaf_node.value().clone())),
-                     proof.siblings().into_iter().rev().map(|h| *h).collect())
+                        leaf_node.value().clone())
                 }
-                None => (Arc::new(SparseMerkleNode::new_empty()), vec![]),
-            };
+                None => SparseMerkleNode::new_empty(),
+            });
 
             Self::bulk_update_existing_tree(
                 new_subtree_root,
-                new_siblings,
+                proof.siblings().into_iter().rev().map(|h| *h).collect(),
                 subtree_depth,
                 updates,
                 subtree_update_indices,
@@ -366,59 +405,36 @@ where
             } else {
                 None
             };
-            
-            match Self::all_keys_equal_to(updates,
-                                          &subtree_update_indices,
-                                          leaf_key) {
-                Some(key) => {
-                    let leaf_hash = if leaf_key.is_some() {
-                        subtree_hash
-                    } else
-                    {
-                        *SPARSE_MERKLE_PLACEHOLDER_HASH
-                    };
-                    
-                    Ok(Self::process_leaf_txn_hashes(leaf_hash,
-                                                     key,
-                                                     updates,
-                                                     &subtree_update_indices))
+
+            if siblings.len() <= subtree_depth {
+                if let Some(key) = Self::all_keys_equal_to(updates,
+                                                           &subtree_update_indices,
+                                                           leaf_key) {
+                    // All keys are the same, and no subtree siblings remaining -
+                    // recursion ends by creating a leaf node and computing hashes.
+                    return Ok(Self::process_leaf_txn_hashes(
+                        if leaf_key.is_some() {
+                            subtree_hash
+                        } else {
+                            *SPARSE_MERKLE_PLACEHOLDER_HASH
+                        },
+                        key,
+                        updates,
+                        &subtree_update_indices));
                 }
-                None => {
-                    let (left_child, left_siblings, right_child, right_siblings) =
-                        match leaf_key {
-                            Some(key) => {
+            }
 
-                                let sibling_hash = siblings
-                                    .get(subtree_depth)
-                                    .unwrap_or(&SPARSE_MERKLE_PLACEHOLDER_HASH);
-                                
-                                let sibling_node = Arc::new(
-                                    if *sibling_hash != *SPARSE_MERKLE_PLACEHOLDER_HASH {
-                                        SparseMerkleNode::new_subtree(*sibling_hash)
-                                    } else {
-                                        SparseMerkleNode::new_empty()
-                                    });
-                                
-                                if key.get_bit(subtree_depth) {
-                                    (sibling_node,
-                                     vec![],
-                                     Arc::clone(&subtree_root),
-                                     siblings)
-                                } else {
-                                    (Arc::clone(&subtree_root),
-                                     siblings,
-                                     sibling_node,
-                                     vec![])
-                                }
-                            }
-                            None =>
-                                (Arc::new(SparseMerkleNode::new_empty()),
-                                 vec![],
-                                 Arc::new(SparseMerkleNode::new_empty()),
-                                 vec![])
-                        };
-
-                    Self::construct_internal_node(
+            // Keep recursing.
+            let (left_child, left_siblings, right_child, right_siblings) = 
+                Self::children_and_siblings(Arc::clone(&subtree_root),
+                                            if siblings.len() > subtree_depth {
+                                                Some(updates[subtree_update_indices[0]].0)
+                                            } else {
+                                                leaf_key
+                                            },
+                                            siblings,
+                                            subtree_depth);
+            Self::construct_internal_node(
                         left_child,
                         left_siblings,
                         right_child,
@@ -427,8 +443,6 @@ where
                         updates,
                         subtree_update_indices,
                         proof_reader)
-                }
-            }
         }
     }
     
