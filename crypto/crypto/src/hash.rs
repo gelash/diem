@@ -229,6 +229,12 @@ impl HashValue {
         Ok(Self::new(buf))
     }
 
+    /// Returns the `index`-th bit.
+    pub fn get_bit(&self, index: usize) -> bool {
+        precondition!(index < HashValue::LENGTH_IN_BITS);
+        self[index / 8] & (1 << (7 - index % 8)) > 0
+    }
+    
     /// Returns the length of common prefix of `self` and `other` in bits.
     pub fn common_prefix_bits_len(&self, other: HashValue) -> usize {
         self.iter_bits()

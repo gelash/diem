@@ -72,8 +72,11 @@ use diem_crypto::{
     hash::{CryptoHash, HashValueBitIterator, SPARSE_MERKLE_PLACEHOLDER_HASH},
     HashValue,
 };
-use diem_types::proof::SparseMerkleProof;
+use diem_types::{
+    proof::{SparseMerkleInternalNode, SparseMerkleLeafNode, SparseMerkleProof}
+};
 use std::sync::Arc;
+use std::cmp;
 
 /// `AccountStatus` describes the result of querying an account from this SparseMerkleTree.
 #[derive(Debug, Eq, PartialEq)]
@@ -135,13 +138,14 @@ where
         Ok(SparseMerkleTree { root })
     }
 
-    /// Constructs a new Sparse Merkle Tree as if we are updating the existing tree multiple times
-    /// with `update_batch`. The function will return the root hash of each individual update and
-    /// a Sparse Merkle Tree of the final state.
+    /// Constructs a new Sparse Merkle Tree as if we are updating the existing tree multiple
+    /// times with `update`. The function will return the root hash of each individual update
+    /// and a Sparse Merkle Tree of the final state.
     ///
-    /// The `update_batch` will take in a reference of value instead of an owned instance. This is
-    /// because it would be nicer for future parallelism.
-    pub fn batch_update(
+    /// The `batch_update_simple` applies `update' method many times, unlike a more optimized
+    /// (and parallelizable) `update_batch' implementation below. It takes in a reference of
+    /// value instead of an owned instance to be consistent with the `batch_update' interface.
+    pub fn batch_update_simple(
         &self,
         update_batch: Vec<Vec<(HashValue, &V)>>,
         proof_reader: &impl ProofRead<V>,
@@ -149,6 +153,7 @@ where
         let mut current_state_tree = Self {
             root: Arc::clone(&self.root),
         };
+
         let mut result_hashes = Vec::with_capacity(update_batch.len());
         for updates in update_batch {
             current_state_tree = current_state_tree.update(
@@ -160,9 +165,60 @@ where
             )?;
             result_hashes.push(current_state_tree.root_hash());
         }
+        
         Ok((result_hashes, current_state_tree))
     }
 
+    /// Constructs a new Sparse Merkle Tree as if we are updating the existing tree multiple
+    /// times with `update`. The function will return the root hash of each individual update
+    /// and a Sparse Merkle Tree of the final state. Since the tree is immutable, the existing
+    /// tree will remain the same and may share parts with the new, returned tree. Unlike
+    /// `batch_update_simple', intermediate trees (after each update) aren't constructed, but
+    /// only their root hashes are computed.
+    ///
+    /// `batch_update_simple' takes in value reference because the bulk update algorithm it
+    /// uses requires a copy per value at the end of tree traversals. Taking in a reference
+    /// avoids double copy (by the caller and by the implementation).
+    pub fn batch_update(
+        &self,
+        update_batch: Vec<Vec<(HashValue, &V)>>,
+        proof_reader: &impl ProofRead<V>,
+    ) -> Result<(Vec<HashValue>, Self), UpdateError> {
+        let mut result_hashes = Vec::with_capacity(update_batch.len());
+        
+        // Construct a vector of updates. Each update is of form (addr_hash, txn_id, value),
+        // such that 0 <= txn_id < n and the txn_id's are sorted.
+        let updates: Vec<(HashValue, usize, &V)> = update_batch
+            .iter()
+            .enumerate()
+            .map(|(i, batch)| batch.iter().map(move |&(hash, value)| (hash, i, value)))
+            .flatten()
+            .collect();
+
+        let (root, txn_hashes) = Self::bulk_update_existing_tree(None,
+                                                                 Arc::clone(&self.root),
+                                                                 vec![],
+                                                                 0,
+                                                                 &updates,
+                                                                 (0..updates.len()).collect(),
+                                                                 proof_reader)?;
+        // Deal with transactions that may not have updates.
+        for i in 0..txn_hashes.len() {
+            let low = if i == 0 { 0 } else { txn_hashes[i].0 - 1 };
+            let high =
+                if i < txn_hashes.len() - 1 {
+                    txn_hashes[i+1].0 - 1
+                } else {
+                    update_batch.len()
+                };
+            for _ in low..high {
+                result_hashes.push(txn_hashes[i].1);
+            }
+        }
+        
+        Ok((result_hashes, SparseMerkleTree { root }))
+    }
+    
     fn update_one(
         root: Arc<SparseMerkleNode<V>>,
         key: HashValue,
@@ -232,7 +288,7 @@ where
                 HashValue::LENGTH_IN_BITS - remaining_bits.len(),
             )),
             Node::Subtree(_) => {
-                // When the search reaches an Subtree node, we need proof to give us more
+                // When the search reaches a Subtree node, we need proof to give us more
                 // information about this part of the tree.
                 let proof = proof_reader
                     .get_proof(key)
@@ -323,7 +379,6 @@ where
         distance_from_root_to_existing_leaf: usize,
     ) -> Arc<SparseMerkleNode<V>> {
         let new_leaf = Arc::new(SparseMerkleNode::new_leaf(key, LeafValue::Value(new_value)));
-
         if key == existing_leaf.key() {
             // This implies that `key` already existed and the proof is an inclusion proof.
             return new_leaf;
@@ -377,6 +432,329 @@ where
                 SparseMerkleNode::new_internal(previous_node, sibling)
             })
         })
+    }
+    
+    /// Returns the new subtree and a vector of pairs (txn_num, hash_value, one_leaf),
+    /// where hash_value. TODO: describe one_leaf: does it contain just 1 leaf we added.
+    /// would be the hash of the root of the subtree if only first txn_num many transactions
+    /// were applied. txn_num = 0 is always included with the original hash. Only relevant
+    /// txn_num values appear (i.e. if a transaction didn't affect the given subtree,
+    /// it will be skipped) in a sorted manner.
+    ///
+    /// subtree_update_indices must be increasing, and updates.1 must be non-decreasing.
+    fn bulk_update_existing_tree(
+        before_hash: Option<HashValue>,
+        subtree_root: Arc<SparseMerkleNode<V>>,
+        siblings: Vec<HashValue>,
+        subtree_depth: usize,
+        updates: &Vec<(HashValue, usize, &V)>,
+        subtree_update_indices: Vec<usize>,
+        proof_reader: &impl ProofRead<V>,
+    ) -> Result<(Arc<SparseMerkleNode<V>>, Vec<(usize, HashValue, bool)>), UpdateError> {
+        let before_hash = match before_hash {
+            Some(subtree_hash) => subtree_hash,
+            None => subtree_root.read_lock().hash(),
+        };
+        
+        if subtree_update_indices.len() == 0 {
+            return Ok((subtree_root,
+                       vec![(0, before_hash, false)]));
+        }
+
+        if let Node::Internal(node) = &*subtree_root.read_lock() {
+            Self::construct_internal_node(
+                before_hash,
+                node.clone_left_child(),
+                vec![],
+                node.clone_right_child(),
+                vec![],
+                subtree_depth,
+                updates,
+                subtree_update_indices,
+                proof_reader)
+        } else if let Node::Subtree(_) = &*subtree_root.read_lock() {
+            let proof = proof_reader
+                .get_proof(updates[subtree_update_indices[0]].0)
+                .ok_or(UpdateError::MissingProof)?;
+
+            let new_subtree_root = Arc::new(match proof.leaf() {
+                Some(existing_leaf) => {
+                    let leaf_node : &LeafNode<V> = &existing_leaf.into();
+                    SparseMerkleNode::new_leaf(
+                        existing_leaf.key(),
+                        leaf_node.value().clone())
+                }
+                None => SparseMerkleNode::new_empty(),
+            });
+
+            Self::bulk_update_existing_tree(
+                Some(before_hash),
+                new_subtree_root,
+                proof.siblings().into_iter().rev().map(|h| *h).collect(),
+                subtree_depth,
+                updates,
+                subtree_update_indices,
+                proof_reader)
+        } else {
+            // Leaf or empty
+            let leaf_key = if let Node::Leaf(leaf) = &*subtree_root.read_lock() {
+                Some(leaf.key())
+            } else {
+                None
+            };
+
+            if siblings.len() <= subtree_depth {
+                if let Some(key) = Self::all_keys_equal_to(updates,
+                                                           &subtree_update_indices,
+                                                           leaf_key) {
+                    // All keys are the same, and no subtree siblings remain:
+                    // recursion ends by creating a leaf node and computing hashes.
+                    return Ok(Self::process_leaf_txn_hashes(
+                        if leaf_key.is_some() {
+                            before_hash
+                        } else {
+                            *SPARSE_MERKLE_PLACEHOLDER_HASH
+                        },
+                        key,
+                        updates,
+                        &subtree_update_indices));
+                }
+            }
+
+            // Keep recursing.
+            let (left_child, left_siblings, right_child, right_siblings) = 
+                Self::children_and_siblings(Arc::clone(&subtree_root),
+                                            if siblings.len() > subtree_depth {
+                                                Some(updates[subtree_update_indices[0]].0)
+                                            } else {
+                                                leaf_key
+                                            },
+                                            siblings,
+                                            subtree_depth);
+            Self::construct_internal_node(before_hash,
+                                          left_child,
+                                          left_siblings,
+                                          right_child,
+                                          right_siblings,
+                                          subtree_depth,
+                                          updates,
+                                          subtree_update_indices,
+                                          proof_reader)
+        }
+    }
+
+    fn children_and_siblings(
+        subtree_root_clone: Arc<SparseMerkleNode<V>>,
+        child_key: Option<HashValue>,
+        siblings: Vec<HashValue>,
+        subtree_depth: usize,
+    ) -> (Arc<SparseMerkleNode<V>>, Vec<HashValue>, Arc<SparseMerkleNode<V>>, Vec<HashValue>) {
+        match child_key {
+            Some(key) => {
+                let sibling_hash = siblings
+                    .get(subtree_depth)
+                    .unwrap_or(&SPARSE_MERKLE_PLACEHOLDER_HASH);
+
+                let sibling_node = Arc::new(
+                    if *sibling_hash != *SPARSE_MERKLE_PLACEHOLDER_HASH {
+                        SparseMerkleNode::new_subtree(*sibling_hash)
+                    } else {
+                        SparseMerkleNode::new_empty()
+                    });
+
+                if key.get_bit(subtree_depth) {
+                    (sibling_node,
+                     vec![],
+                     subtree_root_clone,
+                     siblings)
+                } else {
+                    (subtree_root_clone,
+                     siblings,
+                     sibling_node,
+                     vec![])
+                }
+            }
+            None =>
+                (Arc::new(SparseMerkleNode::new_empty()),
+                 vec![],
+                 Arc::new(SparseMerkleNode::new_empty()),
+                 vec![])
+        }
+    }
+
+    fn construct_internal_node(
+        before_hash: HashValue,
+        left_child: Arc<SparseMerkleNode<V>>,
+        left_siblings: Vec<HashValue>,
+        right_child: Arc<SparseMerkleNode<V>>,
+        right_siblings: Vec<HashValue>,
+        node_depth: usize,
+        updates: &Vec<(HashValue, usize, &V)>,
+        subtree_update_indices: Vec<usize>,
+        proof_reader: &impl ProofRead<V>,
+    ) -> Result<(Arc<SparseMerkleNode<V>>, Vec<(usize, HashValue, bool)>), UpdateError> {
+        let (left_indices, right_indices) =
+            Self::partition_indices(updates,
+                                    subtree_update_indices,
+                                    node_depth);
+        // TODO: execute these calls in parallel up to a certain depth.
+        let (left_child, left_txn_hashes) =
+            Self::bulk_update_existing_tree(None,
+                                            left_child,
+                                            left_siblings,
+                                            node_depth + 1,
+                                            updates,
+                                            left_indices,
+                                            proof_reader)?;
+        let (right_child, right_txn_hashes) =
+            Self::bulk_update_existing_tree(None,
+                                            right_child,
+                                            right_siblings,
+                                            node_depth + 1,
+                                            updates,
+                                            right_indices,
+                                            proof_reader)?;
+
+        let new_subtree_root =
+            Arc::new(SparseMerkleNode::new_internal(left_child, right_child));
+        let merged_txn_hashes = Self::merge_txn_hashes(before_hash,
+                                                       left_txn_hashes,
+                                                       right_txn_hashes);
+        Ok((new_subtree_root, merged_txn_hashes))
+    }
+    
+    // Partition indices vector into two vectors, based on the bit value at bit_index of
+    // the Hashvalue stored at updates[index]. The order is maintained.
+    fn partition_indices(
+        updates: &Vec<(HashValue, usize, &V)>,
+        indices: Vec<usize>,
+        bit_index: usize
+    ) -> (Vec<usize>, Vec<usize>) {
+        indices
+            .into_iter()
+            .partition(|&index| !updates[index].0.get_bit(bit_index))
+    }
+
+    // If updates vector, at specified, non-empty indices contains the same HashValues,
+    // it's returned, otherwise None.
+    fn all_keys_equal_to(
+        updates: &Vec<(HashValue, usize, &V)>,
+        indices: &Vec<usize>,
+        maybe_key: Option<HashValue>
+    ) -> Option<HashValue> {
+        match indices.len() {
+            0 => None,
+            _ => {
+                let base_hashvalue = match maybe_key {
+                    Some(key) => key,
+                    None => updates[indices[0]].0,
+                };
+
+                if indices.into_iter().all(|&i| updates[i].0 == base_hashvalue) {
+                    Some(base_hashvalue)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    // Given a leaf's original hash, key and transactions tha affect it (described by
+    // the relevant update indices), produce intermediate hashes and resulting leaf node.
+    // Indices must be increasing and updates.1 (txn_num's) must be non-decreasing.
+    fn process_leaf_txn_hashes(
+        before_hash: HashValue,
+        key: HashValue,
+        updates: &Vec<(HashValue, usize, &V)>,
+        indices: &Vec<usize>,
+    ) -> (Arc<SparseMerkleNode<V>>, Vec<(usize, HashValue, bool)>) {
+        let mut hashes = vec![(0, before_hash, false)];
+
+        let txn_and_update_index: Vec<(usize, usize)> = indices
+            .iter()
+            .map(|&i| (updates[i].1 + 1, i))
+            .collect();
+
+        txn_and_update_index
+            .iter()
+            .take(txn_and_update_index.len() - 1)
+            .for_each(|&(num_txn, i)| {
+                let value_hash = updates[i].2.hash();
+                let leaf_hash = SparseMerkleLeafNode::new(key, value_hash).hash();
+                hashes.push((num_txn, leaf_hash, true));
+            });
+
+        let (last_txn_num, last_update_index) = *txn_and_update_index.last().unwrap();
+
+        let final_leaf = Arc::new(
+            SparseMerkleNode::new_leaf(key,
+                                       LeafValue::Value(updates[last_update_index].2.clone()))
+        );
+
+        hashes.push((last_txn_num, final_leaf.read_lock().hash(), true));
+
+        (final_leaf, hashes)
+    }
+
+    fn merge_txn_hashes(
+        before_hash: HashValue,
+        left_txn_hashes: Vec<(usize, HashValue, bool)>,
+        right_txn_hashes: Vec<(usize, HashValue, bool)>,
+    ) -> Vec<(usize, HashValue, bool)> {
+        let mut ret = vec![(0, before_hash, false)];
+
+        let mut li = 1;
+        let mut ri = 1;
+
+        let next_txn_num = |i: usize, txn_hashes: &Vec<(usize, HashValue, bool)>| {
+            if i < txn_hashes.len() {
+                txn_hashes[i].0
+            } else {
+                usize::MAX
+            }
+        };
+
+        let mut to_hash = vec![];
+        while li < left_txn_hashes.len() || ri < right_txn_hashes.len() {
+            let left_txn_num = next_txn_num(li, &left_txn_hashes);
+            let right_txn_num = next_txn_num(ri, &right_txn_hashes);
+            if left_txn_num <= right_txn_num {
+                li = li + 1;
+            }
+            if right_txn_num <= left_txn_num {
+                ri = ri + 1;
+            }
+            
+            let override_hash =
+                if left_txn_hashes[li-1].2 &&
+                right_txn_hashes[ri-1].1 == *SPARSE_MERKLE_PLACEHOLDER_HASH {
+                    Some(left_txn_hashes[li-1].1)
+                } else if right_txn_hashes[ri-1].2 &&
+                left_txn_hashes[li-1].1 == *SPARSE_MERKLE_PLACEHOLDER_HASH {
+                    Some(right_txn_hashes[ri-1].1)
+                } else {
+                    None
+                };
+                
+            to_hash.push((cmp::min(left_txn_num, right_txn_num),
+                          left_txn_hashes[li-1].1,
+                          right_txn_hashes[ri-1].1,
+                          override_hash));
+        }
+
+        ret.extend(
+            to_hash
+                // TODO: par_iter when appropriate.
+                .iter()
+                .map(|&(txn_num, left_hash, right_hash, override_hash)|
+                     (txn_num,
+                      match override_hash {
+                          Some(hash) => hash,
+                          None => SparseMerkleInternalNode::new(left_hash, right_hash).hash(),
+                      },
+                      override_hash.is_some()))
+        );
+        ret
     }
 
     /// Queries a `key` in this `SparseMerkleTree`.
