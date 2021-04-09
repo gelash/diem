@@ -520,11 +520,18 @@ where
             // Keep recursing.
             let (left_child, left_siblings, right_child, right_siblings) = 
                 Self::children_and_siblings(Arc::clone(&subtree_root),
-                                            if siblings.len() > subtree_depth {
+                                            if let Some(key) = leaf_key {
+                                                Some(key)
+                                            } else if siblings.len() > subtree_depth {
                                                 Some(updates[subtree_update_indices[0]].0)
                                             } else {
-                                                leaf_key
+                                                None
                                             },
+                                            // if siblings.len() > subtree_depth {
+                                                // Some(updates[subtree_update_indices[0]].0)
+                                            // } else {
+                                                // leaf_key
+                                            // },
                                             siblings,
                                             subtree_depth);
             Self::construct_internal_node(before_hash,
