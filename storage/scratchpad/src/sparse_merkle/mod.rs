@@ -521,17 +521,10 @@ where
             let (left_child, left_siblings, right_child, right_siblings) = 
                 Self::children_and_siblings(Arc::clone(&subtree_root),
                                             if let Some(key) = leaf_key {
-                                                Some(key)
-                                            } else if siblings.len() > subtree_depth {
-                                                Some(updates[subtree_update_indices[0]].0)
+                                                key
                                             } else {
-                                                None
-                                            },
-                                            // if siblings.len() > subtree_depth {
-                                                // Some(updates[subtree_update_indices[0]].0)
-                                            // } else {
-                                                // leaf_key
-                                            // },
+                                                updates[subtree_update_indices[0]].0
+                                            }, 
                                             siblings,
                                             subtree_depth);
             Self::construct_internal_node(before_hash,
@@ -548,40 +541,31 @@ where
 
     fn children_and_siblings(
         subtree_root_clone: Arc<SparseMerkleNode<V>>,
-        child_key: Option<HashValue>,
+        key: HashValue,
         siblings: Vec<HashValue>,
         subtree_depth: usize,
     ) -> (Arc<SparseMerkleNode<V>>, Vec<HashValue>, Arc<SparseMerkleNode<V>>, Vec<HashValue>) {
-        match child_key {
-            Some(key) => {
-                let sibling_hash = siblings
-                    .get(subtree_depth)
-                    .unwrap_or(&SPARSE_MERKLE_PLACEHOLDER_HASH);
+        let sibling_hash = siblings
+            .get(subtree_depth)
+            .unwrap_or(&SPARSE_MERKLE_PLACEHOLDER_HASH);
 
-                let sibling_node = Arc::new(
-                    if *sibling_hash != *SPARSE_MERKLE_PLACEHOLDER_HASH {
-                        SparseMerkleNode::new_subtree(*sibling_hash)
-                    } else {
-                        SparseMerkleNode::new_empty()
-                    });
+        let sibling_node = Arc::new(
+            if *sibling_hash != *SPARSE_MERKLE_PLACEHOLDER_HASH {
+                SparseMerkleNode::new_subtree(*sibling_hash)
+            } else {
+                SparseMerkleNode::new_empty()
+            });
 
-                if key.get_bit(subtree_depth) {
-                    (sibling_node,
-                     vec![],
-                     subtree_root_clone,
-                     siblings)
-                } else {
-                    (subtree_root_clone,
-                     siblings,
-                     sibling_node,
-                     vec![])
-                }
-            }
-            None =>
-                (Arc::new(SparseMerkleNode::new_empty()),
-                 vec![],
-                 Arc::new(SparseMerkleNode::new_empty()),
-                 vec![])
+        if key.get_bit(subtree_depth) {
+            (sibling_node,
+             vec![],
+             subtree_root_clone,
+             siblings)
+        } else {
+            (subtree_root_clone,
+             siblings,
+             sibling_node,
+             vec![])
         }
     }
 
