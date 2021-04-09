@@ -510,11 +510,7 @@ where
                     // All keys are the same, and no subtree siblings remain:
                     // recursion ends by creating a leaf node and computing hashes.
                     return Ok(Self::process_leaf_txn_hashes(
-                        if leaf_key.is_some() {
-                            before_hash
-                        } else {
-                            *SPARSE_MERKLE_PLACEHOLDER_HASH
-                        },
+                        before_hash,
                         key,
                         updates,
                         &subtree_update_indices));
