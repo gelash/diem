@@ -84,7 +84,7 @@ num-integer = { version = "0.1.44", default-features = false, features = ["i128"
 num-traits = { version = "0.2.14", features = ["default", "i128", "std"] }
 once_cell = { version = "1.7.2", features = ["alloc", "default", "race", "std"] }
 petgraph = { version = "0.5.1", features = ["default", "graphmap", "matrix_graph", "stable_graph"] }
-proc-macro2 = { version = "0.4.30", features = ["default", "proc-macro"] }
+proc-macro2 = { version = "1.0.27", features = ["default", "proc-macro"] }
 prost = { version = "0.7.0", features = ["default", "prost-derive", "std"] }
 quote = { version = "0.6.13", features = ["default", "proc-macro"] }
 rand = { version = "0.8.3", features = ["alloc", "default", "getrandom", "libc", "rand_chacha", "rand_hc", "small_rng", "std", "std_rng"] }
@@ -179,7 +179,7 @@ num-integer = { version = "0.1.44", default-features = false, features = ["i128"
 num-traits = { version = "0.2.14", features = ["default", "i128", "std"] }
 once_cell = { version = "1.7.2", features = ["alloc", "default", "race", "std"] }
 petgraph = { version = "0.5.1", features = ["default", "graphmap", "matrix_graph", "stable_graph"] }
-proc-macro2 = { version = "0.4.30", features = ["default", "proc-macro"] }
+proc-macro2 = { version = "1.0.27", features = ["default", "proc-macro"] }
 prost = { version = "0.7.0", features = ["default", "prost-derive", "std"] }
 quote = { version = "0.6.13", features = ["default", "proc-macro"] }
 rand = { version = "0.8.3", features = ["alloc", "default", "getrandom", "libc", "rand_chacha", "rand_hc", "small_rng", "std", "std_rng"] }
